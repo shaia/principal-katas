@@ -1,0 +1,17 @@
+.venv/
+venv/
+
+__pycache__/
+*.py[cod]
+
+# hatchling build output and the editable-install metadata
+build/
+dist/
+*.egg-info/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/

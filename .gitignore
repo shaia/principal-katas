@@ -1,0 +1,34 @@
+# Repo-wide noise only. Build output is ignored by the .gitignore inside each
+# language folder, next to the tooling that produces it.
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editors / IDEs
+*~
+*.swp
+*.swo
+.idea/
+.vs/
+.vscode/ipch/
+.vscode/*.log
+# Personal: configures the C/C++ Runner extension, which nothing here builds
+# with, and hardcodes a local Visual Studio install path.
+.vscode/settings.json
+# .vscode/{launch,tasks,c_cpp_properties}.json stay tracked — they are the
+# build and debug wiring for the katas.
+
+# Tool caches written at the repo root
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.cache/
+
+# Local scratch and secrets
+.env
+.env.local
+scratch/

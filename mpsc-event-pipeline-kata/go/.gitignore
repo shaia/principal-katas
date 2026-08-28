@@ -1,0 +1,11 @@
+bin/
+*.exe
+
+# `go test -c` binaries and the profiles the bench phases can emit
+*.test
+*.out
+*.prof
+
+# Local module overrides — the kata builds against the module in go.mod alone
+go.work
+go.work.sum

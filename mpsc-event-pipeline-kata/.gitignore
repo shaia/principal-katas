@@ -1,0 +1,11 @@
+# Kata-wide artifacts. cpp/, go/ and python/ each ignore their own build output.
+
+# Droppings from profiling and sanitizer runs — these katas are benchmarked
+# under perf, valgrind and ASan/TSan, and none of it is language-specific.
+perf.data
+perf.data.old
+callgrind.out.*
+massif.out.*
+*.stackdump
+core
+core.*

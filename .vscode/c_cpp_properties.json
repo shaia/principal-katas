@@ -1,0 +1,19 @@
+{
+  "configurations": [
+    {
+      // Flags come from the build, not from a hand-maintained guess: CMakeLists
+      // sets CMAKE_EXPORT_COMPILE_COMMANDS specifically so tooling can read
+      // them. Previously this claimed gcc, which is not what builds this project.
+      "name": "clang-msvc-x64",
+      "compileCommands": "${workspaceFolder}/mpsc-event-pipeline-kata/cpp/build/compile_commands.json",
+      "compilerPath": "C:/Program Files/LLVM/bin/clang++.exe",
+      "cppStandard": "c++20",
+      "intelliSenseMode": "windows-clang-x64",
+      "includePath": [
+        "${workspaceFolder}/mpsc-event-pipeline-kata/cpp/src",
+        "${workspaceFolder}/mpsc-event-pipeline-kata/cpp/bench"
+      ]
+    }
+  ],
+  "version": 4
+}

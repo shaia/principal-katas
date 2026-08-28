@@ -1,0 +1,20 @@
+# CMake build trees. build-debug/ is a real one; build-* covers the sanitizer
+# trees (WEIR_ASAN / WEIR_TSAN) that get configured alongside it.
+build/
+build-*/
+cmake-build-*/
+CMakeUserPresets.json
+
+# CMakeLists.txt pins CMAKE_RUNTIME_OUTPUT_DIRECTORY here, so bin/ is generated
+# output whichever build tree produced it.
+bin/
+
+# CMAKE_EXPORT_COMPILE_COMMANDS writes this for clangd; .cache/ is clangd's.
+compile_commands.json
+.cache/
+
+# MSVC intermediates that land outside the build tree
+*.obj
+*.pdb
+*.ilk
+*.exe
