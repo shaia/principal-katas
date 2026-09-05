@@ -258,5 +258,16 @@ available before you write a line of it.
 
 </details>
 
+[**solution.md**](solution.md) — the worked C++ answer, with every number produced by
+`bin/solution.exe`.
+
+| This step | Answered in |
+|---|---|
+| C1 | §1 why not the alternatives · §4 the mechanism, re-priced · §5 code size, and a folklore that did not survive |
+| C2 | §7 the ABI — the struct, both extension mechanisms, and an old plugin driven by a new host |
+| C3 | §8 ownership, allocators, and the unload you probably cannot do |
+| C4 | §9 errors, and a claim that did not survive contact |
+| C5 | §12 verification, and what this platform cannot measure |
+
 Then read what the same questions look like in the other two:
 [go/question.md](../go/question.md) · [python/question.md](../python/question.md).
