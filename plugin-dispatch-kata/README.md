@@ -18,6 +18,17 @@ language tracks then ask what the shared question cannot:
 [cpp/question.md](cpp/question.md) · [go/question.md](go/question.md) ·
 [python/question.md](python/question.md).
 
+## Start here
+
+📖 [**Your profiler said `dispatch`. It did not say `virtual`.**](doc/your-profiler-said-dispatch.md)
+— the long-form walkthrough, with diagrams, generated figures and animations. Written to be learned
+from rather than to be right: it derives the numbers instead of quoting them, stops to explain the
+background it depends on, asks you to predict results before showing them, and keeps the three
+claims that turned out wrong under measurement.
+
+[**cpp/solution.md**](cpp/solution.md) is the same answer stated as an answer — denser, and assumes
+you have worked the kata.
+
 ## Why three languages, when the menu is C++'s
 
 The brief's four options — virtual, `std::variant`, templates, custom type erasure — are a C++
