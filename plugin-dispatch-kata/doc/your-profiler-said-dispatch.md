@@ -524,11 +524,11 @@ At any moment, at most about 18 of your 100 handlers can be resident.
 
 ### The experiment
 
-Two arms, differing in exactly one thing:
+Two arms, differing only in the traffic they are sent:
 
 - **hot** — every packet goes to the *same* handler. Its code stays in L1i; the indirect call always
   has the same target, so the branch predictor is always right.
-- **mixed** — the realistic distribution across all 100 handlers.
+- **mixed** — skewed, Zipf-shaped traffic across all 100 handlers.
 
 Same selection. Same mechanism. Same handler bodies. Only the *access pattern* differs.
 
@@ -931,7 +931,7 @@ there costs one `std::sort`.
 
 ![Sorting the handler list by observed frequency](figures/anim2-frequency-ordering.gif)
 
-> **Predict.** At realistic 95/5 traffic, how much of the total available improvement does sorting
+> **Predict.** At 95/5 traffic, how much of the total available improvement does sorting
 > the list capture, and how much is left for the table?
 
 ### The measurement
@@ -949,13 +949,13 @@ on, which is better than any real system could manage.
 | **95/5** | 92.3 ns | 86.8 ns — **94 %** | 5.5 ns — **6 %** |
 | worst | 107.5 ns | 104.2 ns — **97 %** | 3.3 ns — 3 % |
 
-**At 95/5 traffic — which is what real protocol mixes look like — sorting the list captures 94 % of
+**At 95/5 traffic, where two protocols carry almost every packet, sorting the list captures 94 % of
 everything available, and the entire rewrite adds 6 %.**
 
 ![Everything against the budget](figures/fig4-budget.png)
 
 The pattern is the finding: **the more skewed the traffic, the less the rewrite buys.** Under uniform
-traffic there is no order to exploit and the table is the only thing that helps; under realistic
+traffic there is no order to exploit and the table is the only thing that helps; under heavy
 skew it is almost redundant.
 
 ### So why build the table at all?
