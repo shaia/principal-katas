@@ -81,12 +81,16 @@ before anything is built.
 ## Notable results
 
 - **The profile pointed at a function; the option list assumed a line.** At 100 handlers the scan
-  runs 52.3 `matches()` calls and spends 142.8 ns — 43 % of the 333 ns budget — before any handler
-  does useful work. The dispatch mechanism the four options compete over costs 8.6–11.0 ns.
+  runs 52.3 `matches()` calls per packet and the scan arm costs 142.8 ns — 43 % of the 333 ns budget.
+  The table arm runs the same handler bodies for 67.8 ns, so the search itself is about 75 ns, spent
+  before any handler does useful work. The dispatch mechanism the four options compete over costs
+  8.6–11.0 ns.
   ([cpp §2](cpp/solution.md#2-costing-the-scan), [§4](cpp/solution.md#4-the-mechanism-re-priced))
-- **The instruction cache costs three times more than the mechanism** — 33–37 ns against ~10 ns —
-  and a one-handler microbenchmark cannot see it, because with one handler resident all four
-  mechanisms land within 1.5 ns of each other. The control that makes this readable is a `direct-call`
+- **A hundred interleaved handlers cost three times what the mechanism does** — 33–37 ns against
+  ~10 ns — and a one-handler microbenchmark cannot see it, because with one handler resident all four
+  mechanisms land within 1.5 ns of each other. Most of that gap is the instruction cache; the rest is
+  the call target turning unpredictable, which the mechanism column already pays, and taking it out
+  by subtraction still leaves about 25 ns. The control that makes this readable is a `direct-call`
   arm whose i-cache column reads **0.10 ns**. ([cpp §4](cpp/solution.md#4-the-mechanism-re-priced))
 - **The benchmark nearly lied about its own headline.** The first packet generator assigned traffic
   weights to handlers in registration order, so the busiest handler was already first and sorting had

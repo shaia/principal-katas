@@ -341,7 +341,7 @@ def fig3_mechanism() -> None:
     axb.text(
         0.0,
         -0.20,
-        "tiny handlers, floor subtracted. 3 % of the 333 ns budget —\nand a third of what the instruction cache costs.",
+        "tiny handlers, floor subtracted. 3 % of the 333 ns budget —\nand a third of what interleaving 100 handlers costs.",
         transform=axb.transAxes,
         fontsize=8,
         color=MUTED,
@@ -484,7 +484,7 @@ def anim1_scan_vs_table() -> None:
             rboxes[target].set_facecolor(ACCENT)
             rtxt.set_text("matches() calls: 0")
             rfoot.set_text(
-                "1 load, 1 call\n67.8 ns — the handler's own work" if f >= target else ""
+                "1 load, 1 call\n67.8 ns — the same handlers, found by index" if f >= target else ""
             )
         return lboxes + rboxes + [ltxt, rtxt, lfoot, rfoot, arrow]
 
@@ -641,9 +641,9 @@ def anim3_icache() -> None:
 
         if f >= len(calls):
             note.set_text(
-                f"Same selection, same mechanism, same handler bodies. The only difference is how many\n"
-                f"of them the front end has to keep fetching — and it costs {m[3]:.1f} ns/packet, three times\n"
-                "what choosing between virtual, variant and type erasure is worth."
+                f"Same selection, same mechanism, same handler bodies. What differs is how many of them the\n"
+                f"front end has to keep fetching, and whether it can guess the call's target: {m[3]:.1f} ns/packet\n"
+                "together, three times what the dispatch mechanism itself costs."
             )
         return hot_boxes + mix_boxes + [hot_txt, mix_txt, note]
 

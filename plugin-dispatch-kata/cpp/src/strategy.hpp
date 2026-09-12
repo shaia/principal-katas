@@ -195,7 +195,7 @@ class TableDirect16 {
 // The same table over a remapped key that actually fits in cache. The mapping
 // is the low bits of the protocol, verified injective over the registered key
 // set at construction — a real system needs collision handling here, and the
-// point of measuring both is that the 512 KiB version's extra cost is a cache
+// point of measuring both is that the 1 MiB version's extra cost is a cache
 // miss per lookup, not an instruction.
 class TableCompact {
   public:

@@ -142,7 +142,7 @@ return Result::unsupported();
 ```
 
 The order matters: **fix selection first, then ask about the mechanism.** Asked before §2, "virtual
-or variant?" is a question about 10 ns inside a 143 ns problem.
+or variant?" is a question about 10 ns next to a 75 ns search.
 
 ### Why not the alternatives
 
@@ -181,8 +181,9 @@ traffic, 100 generated handlers of 1800 B each:
 ```
 
 Cost is linear in *probes*, not in anything the four options address. At 100 handlers the scan runs
-**52.3 `matches()` calls per packet** and spends 142.8 ns — 43 % of the entire 333 ns budget — before
-any handler does useful work.
+**52.3 `matches()` calls per packet**, and the scan arm costs 142.8 ns — 43 % of the entire 333 ns
+budget. Both arms run the same handler bodies, so the difference is the search: **about 75 ns, 23 %
+of the budget, spent finding the handler before it does any useful work.**
 
 The table's own curve is the more interesting one. Selection is O(1), yet the table still goes 36.2
 → 67.8 ns as handlers go 10 → 100. Nothing about the lookup changed; what changed is that 100
@@ -191,7 +192,7 @@ costs — through the instruction cache.** §4 measures that separately.
 
 So the answer to step 0 is: the profile pointed at a function, the option list assumed a line, and
 the line it assumed is not the one. The four alternatives compete for the ~10 ns the mechanism costs
-while the scan spends 143.
+while the search spends 75.
 
 ---
 
@@ -262,14 +263,22 @@ footprint.
 
 **The dispatch mechanism costs 8.6–11.0 ns** (each `mixed-tiny` minus the 0.91 ns floor): erasure
 8.57, virtual 10.24, variant 10.98. Against a 333 ns budget that is **3 % of the packet**. Against
-the 143 ns the scan cost in §2, it is noise. This is the answer to the brief's question, and the
+the ~75 ns the search cost in §2, it is a seventh. This is the answer to the brief's question, and the
 answer is that the question was not important.
 
-**The instruction cache costs three times more than the mechanism.** The `i-cache` column is
+**A hundred interleaved handlers cost three times more than the mechanism, most of it in the
+instruction cache.** The `i-cache` column is
 `mixed − hot`: 33–37 ns for every real mechanism. The control is `direct-call` at **0.10 ns** — it
 always calls the same handler, so it has no i-cache cost to pay, which is exactly what the column
 reports. That control is what makes the other three readable; without it, 33 ns could have been
 anything.
+
+The column is not the instruction cache alone. `hot` also has a perfectly predicted call target and
+`mixed` does not, and `mixed-tiny` runs the same mixed traffic, so the mechanism figure above already
+includes that misprediction. Taking it out by subtraction, assuming the two costs simply add:
+virtual's predicted dispatch costs 1.3 ns (27.57 against direct-call's 26.26) and its dispatch under
+mixed traffic 10.2 ns, so about 9 ns of the 33.7 is the mispredicted target and about 25 ns is
+fetching code. That is still two and a half times the whole mechanism.
 
 So the ranking that a one-handler microbenchmark produces (all four within 1.5 ns of each other, at
 26–28 ns) is not the ranking that matters, and the effect it cannot see is larger than the effect it
@@ -621,7 +630,8 @@ eliminator is entitled to delete — it is what keeps the work alive without a c
 barrier. The mpsc kata never needed one because every measured path there crossed a thread boundary.
 
 **The clean run is not vacuous.** Deliberately breaking `TableCompact` so it skips its residual list
-produced eight distinct failures and exit code 1:
+produced eight failures, from five distinct checks (one of them fails at all four handler counts),
+and exit code 1:
 
 ```
   FAIL: table-compact: agrees with the brief's loop on every packet

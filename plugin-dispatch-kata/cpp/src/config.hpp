@@ -22,8 +22,8 @@ inline constexpr std::uint16_t kUnmatchedKeyBase = 4096;
 inline constexpr double        kUnmatchedFraction = 0.02;
 
 // The protocol field is 16 bits, so a directly-indexed table has this many
-// slots whether or not they are used. 65536 * 8 B = 512 KiB of mostly-empty
-// pointers, which is the density argument of step 2 made measurable: phase 3
+// slots whether or not they are used. 65536 * 16 B = 1024 KiB of mostly-empty
+// slots, which is the density argument of step 2 made measurable: phase 3
 // runs both this and a compact remapped table.
 inline constexpr std::size_t kKeySpace16 = 1u << 16;
 

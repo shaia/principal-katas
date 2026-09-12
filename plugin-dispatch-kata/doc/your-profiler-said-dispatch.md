@@ -114,7 +114,7 @@ Now look at what the profiler actually said: *`dispatch` is expensive.* That is 
 ```text
   what the profiler measured        what the option list assumes
   --------------------------        ----------------------------
-  dispatch()  ......... 43 %        the virtual call in it is slow
+  dispatch()  ......... hot         the virtual call in it is slow
      |
      +-- for (auto& h : handlers)   <-- nobody looked here
      +-- h->matches(p)              <-- or here
@@ -196,12 +196,14 @@ at all (a real service always has some).
 <summary>Answer</summary>
 
 From the handlers whose predicate is *not* just a key comparison. In the benchmark, 10 % of handlers
-also test a payload byte, and several of them share a protocol key. A packet carrying such a key has
-to walk past the ones whose extra condition fails before reaching the one that matches — and those
-sit at positions 8, 38, 68 and 98, averaging 53 rather than 50.5.
+also test a payload byte, and they share three protocol keys among them. A packet carrying one of
+those keys has to walk past the handlers whose extra condition fails before reaching the one that
+matches, and every one of them is eighth in its ten: key 901's four sit at positions 8, 38, 68 and
+98, averaging 53 rather than 50.5. Keys 900 and 902 have only three handlers for four payload values,
+so one packet in four carrying them matches nobody and walks all 100.
 
-Redo the arithmetic with that split and you get 51.7 against a measured 52.3, which is about 1 %.
-That is close enough to say you understand the system.
+Redo the arithmetic with that split, enumerating every handler and payload value, and you get 52.2
+against a measured 52.3. That is close enough to say you understand the system.
 
 </details>
 
@@ -209,8 +211,10 @@ That is close enough to say you understand the system.
 
 ![Cost is linear in probes, not in the dispatch mechanism](figures/fig1-scan-vs-table.png)
 
-At 100 handlers the loop runs **52.3 `matches()` calls** and spends **142.8 ns** — **43 % of the
-entire budget** — before any handler does one byte of useful work.
+At 100 handlers the loop runs **52.3 `matches()` calls** per packet, and the whole arm costs
+**142.8 ns** — **43 % of the entire budget**. The table arm runs the very same handler bodies for
+67.8 ns, so **about 75 ns** of that is spent finding the handler before it does one byte of useful
+work.
 
 Here is what those probes look like, next to the alternative:
 
@@ -311,6 +315,7 @@ Each slot is one of two shapes:
 
 ```cpp
 struct Slot {
+    uint16_t      key;     // the protocol that claimed this slot, verified on lookup
     Handler*      only;    // fast path: this handler's predicate IS "key matches",
                            //   so once the key selected it, no test is needed at all
     uint32_t      begin;   // slow path: a range into a flat array of candidates,
@@ -536,8 +541,17 @@ Same selection. Same mechanism. Same handler bodies. Only the *access pattern* d
 | variant | 27.72 ns | 64.54 ns | **+36.82** |
 | *direct-call (control)* | *26.26 ns* | *26.36 ns* | *+0.10* |
 
-**33 to 37 ns per packet** — three times what choosing between virtual, variant and type erasure is
-worth. It is 10 % of the entire budget, and it is invisible to any benchmark that uses one handler.
+**33 to 37 ns per packet** — three times what the dispatch mechanism itself costs, and some twenty
+times what choosing between virtual, variant and type erasure is worth. It is 10 % of the entire
+budget, and it is invisible to any benchmark that uses one handler.
+
+Be precise about what that column holds, though, because two things change between the arms, not
+one. The front end has to fetch code that is not in L1i, *and* the indirect call's target stops being
+predictable. §5's mechanism figure already pays for the second, since its tiny handlers see the same
+mixed traffic. Taking it out by subtraction, and assuming the two costs simply add: on `virtual`,
+predicted dispatch costs 1.3 ns (27.57 against `direct-call`'s 26.26) and dispatch under mixed
+traffic 10.2 ns, so about 9 ns of the 33.7 is the mispredicted target and **about 25 ns is fetching
+code**. The instruction cache on its own is still two and a half times the whole mechanism.
 
 ### The control is what makes this trustworthy
 
@@ -1020,7 +1034,8 @@ faster arm that computes something different is not faster — and now it cannot
 ### Make sure your benchmark can fail
 
 Deliberately break something and confirm the harness notices. Skipping the residual list in the table
-produced eight distinct failures and exit code 1:
+produced eight failures, from five distinct checks (one of them fails at all four handler counts),
+and exit code 1:
 
 ```text
   FAIL: table-compact: agrees with the brief's loop on every packet
@@ -1157,12 +1172,13 @@ one commit, and spend the rest of the week on something else.
 
 1. **A profiler attributes time to functions, not lines.** "`dispatch` is expensive" and "the virtual
    call is expensive" are different claims, and the gap between them is where the effort goes.
-2. **Fix selection before mechanism.** O(n) → O(1) was worth ~75 ns; the entire polymorphism debate
-   is worth 10.
+2. **Fix selection before mechanism.** O(n) → O(1) was worth ~75 ns; the whole dispatch mechanism
+   costs 10, and the choice between mechanisms is worth 1.7.
 3. **Some options are excluded by the requirements, not the benchmark.** A closed sum type cannot
    admit a runtime type. That argument survives a faster machine; a benchmark result does not.
-4. **The instruction cache can cost more than the thing you are optimizing.** Here, three times more —
-   and a one-handler microbenchmark cannot see it at all.
+4. **The instruction cache can cost more than the thing you are optimizing.** Here, two and a half
+   times more on its own, three times with the mispredicted call target — and a one-handler
+   microbenchmark cannot see it at all.
 5. **Boundaries and hot paths are different problems.** Nothing obliges them to share a mechanism, and
    the strongest answer refuses the framing that says they must.
 6. **A C ABI is not about portability in the abstract.** One decision makes four silent failure modes
