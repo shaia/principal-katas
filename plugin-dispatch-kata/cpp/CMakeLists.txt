@@ -1,0 +1,119 @@
+cmake_minimum_required(VERSION 3.20)
+project(switchyard_dispatch CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # so clangd sees the right flags
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+
+# Executables and plugins land in <project>/bin, not buried in the build tree,
+# so the thing you run is in a predictable place whichever build directory
+# produced it — and so the host can find the plugins by a fixed relative path.
+set(SWY_BIN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/bin)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${SWY_BIN_DIR})
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${SWY_BIN_DIR})
+foreach(cfg IN LISTS CMAKE_CONFIGURATION_TYPES)
+  string(TOUPPER ${cfg} cfg_upper)
+  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${cfg_upper} ${SWY_BIN_DIR})
+  set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${cfg_upper} ${SWY_BIN_DIR})
+endforeach()
+
+# Header-only: every dispatch arm is a template or an inline class, because the
+# comparison is only fair if the compiler can see all of them equally.
+add_library(switchyard INTERFACE)
+target_include_directories(switchyard INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# ---------------------------------------------------------------- plugins
+#
+# One source file, built twice. plugin_v1 compiles against a genuinely shorter
+# SwyPluginApi — it does not have the process_batch field at all, rather than
+# having it and lying about struct_size — so the host's handling of an old
+# plugin is exercised rather than simulated.
+foreach(level 1 2)
+  add_library(plugin_v${level} SHARED plugin/plugin.cpp)
+  target_link_libraries(plugin_v${level} PRIVATE switchyard)
+  target_compile_definitions(plugin_v${level} PRIVATE SWY_PLUGIN_ABI_LEVEL=${level})
+  set_target_properties(plugin_v${level} PROPERTIES
+    PREFIX ""                       # libplugin_v1.so -> plugin_v1.so; the host
+    CXX_VISIBILITY_PRESET hidden    # builds the filename, so keep it uniform
+    VISIBILITY_INLINES_HIDDEN ON)
+endforeach()
+
+# Hidden visibility is not cosmetic. With default visibility the loader may
+# interpose one binary's definition of an inline function or a template
+# instantiation on the other's, silently, with no diagnostic anywhere in the
+# toolchain — and the two definitions were compiled with different flags. One
+# exported symbol means there is nothing to interpose.
+
+# ---------------------------------------------------------------- benchmark
+
+add_executable(solution
+  bench/main.cpp
+  bench/harness.cpp
+  bench/instrument.cpp
+  bench/invariants.cpp
+  bench/scan.cpp
+  bench/distribution.cpp
+  bench/mechanism.cpp
+  bench/codesize.cpp
+  bench/boundary.cpp)
+target_link_libraries(solution PRIVATE switchyard)
+target_include_directories(solution PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+add_dependencies(solution plugin_v1 plugin_v2)
+
+# Same reasoning as mpsc's: every build type writes to one shared bin/, so an
+# unsuffixed Debug build would overwrite the Release binary and you would
+# benchmark -O0 without noticing.
+set_target_properties(solution PROPERTIES DEBUG_POSTFIX _debug)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC" OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+  target_compile_options(solution PRIVATE /W4)
+else()
+  target_compile_options(solution PRIVATE -Wall -Wextra)
+endif()
+
+# The phases read two generated text files (bin/sizes.txt and the plugin paths)
+# with fopen/sscanf, which the MSVC CRT deprecates in favour of its _s variants.
+# Those are not portable and this code is; the warning is noise on this target
+# rather than a finding, and a clean build is worth more than three suppressed
+# lines of it.
+if(WIN32)
+  target_compile_definitions(solution PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+# ------------------------------------------------------------- code size
+#
+# Phase 5 reports .text per dispatch mechanism, which cannot be measured from
+# inside one binary that contains all of them. Each probe is a separate
+# executable containing exactly one mechanism over the same 100 handlers;
+# llvm-size reads the sections at build time and writes bin/sizes.txt, which
+# the phase then reads. If llvm-size is absent the phase says so rather than
+# inventing a number.
+find_program(SWY_LLVM_SIZE NAMES llvm-size size)
+
+set(SWY_SIZE_PROBES empty none virtual erasure variant)
+foreach(mech IN LISTS SWY_SIZE_PROBES)
+  add_executable(size_${mech} bench/size_probe.cpp)
+  target_link_libraries(size_${mech} PRIVATE switchyard)
+  string(TOUPPER ${mech} mech_upper)
+  target_compile_definitions(size_${mech} PRIVATE SWY_SIZE_MECH_${mech_upper})
+endforeach()
+
+if(SWY_LLVM_SIZE)
+  set(SWY_SIZE_ARGS "")
+  foreach(mech IN LISTS SWY_SIZE_PROBES)
+    list(APPEND SWY_SIZE_ARGS $<TARGET_FILE:size_${mech}>)
+  endforeach()
+  add_custom_target(sizes ALL
+    COMMAND ${CMAKE_COMMAND} -E echo "# generated by llvm-size at build time" > ${SWY_BIN_DIR}/sizes.txt
+    COMMAND ${SWY_LLVM_SIZE} ${SWY_SIZE_ARGS} >> ${SWY_BIN_DIR}/sizes.txt
+    VERBATIM)
+  foreach(mech IN LISTS SWY_SIZE_PROBES)
+    add_dependencies(sizes size_${mech})
+  endforeach()
+  add_dependencies(solution sizes)
+endif()

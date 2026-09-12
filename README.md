@@ -12,7 +12,13 @@ different conclusions. Where they do, the disagreement is the finding.
 | | the question | tracks |
 |---|---|---|
 | [**mpsc-event-pipeline-kata**](mpsc-event-pipeline-kata/) | Many producers push small events to a single consumer that batches them into a socket. Millions of events/sec, bounded memory, producers must never block indefinitely, and order is preserved **per producer, not globally** — the clause that permits an architecture with no shared coordination point at all. Follow-up: 64 producers but only 4–8 active, so stop polling 64 empty queues without reintroducing a contended global. | C++ · Go · Python |
-| [**plugin-dispatch-kata**](plugin-dispatch-kata/) *(questions only)* | 50–100 protocol handlers, some built in and some loaded from shared libraries, selected by linear scan at millions of packets/sec. Profiling blames `dispatch`; the team proposes four polymorphism mechanisms. **The profile never said the virtual call was the problem**, and all four options change how `process` is called rather than how many times `matches` is. Then the half it leads to: the right mechanism at the ABI boundary and the right mechanism on the hot path are not the same one, and nothing requires them to be. | C++ · Go · Python |
+| [**plugin-dispatch-kata**](plugin-dispatch-kata/) *(C++ answered)* | 50–100 protocol handlers, some built in and some loaded from shared libraries, selected by linear scan at millions of packets/sec. Profiling blames `dispatch`; the team proposes four polymorphism mechanisms. **The profile never said the virtual call was the problem**, and all four options change how `process` is called rather than how many times `matches` is. Then the half it leads to: the right mechanism at the ABI boundary and the right mechanism on the hot path are not the same one, and nothing requires them to be. | C++ · Go · Python |
+
+## Long-form
+
+- [**Your profiler said `dispatch`. It did not say `virtual`.**](plugin-dispatch-kata/doc/your-profiler-said-dispatch.md)
+  — the plugin-dispatch C++ answer walked through end to end, with generated figures and animations,
+  including the three claims that did not survive being measured.
 
 ## How a kata is laid out
 

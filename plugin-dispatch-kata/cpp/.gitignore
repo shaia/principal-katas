@@ -1,0 +1,26 @@
+# CMake build trees.
+build/
+build-*/
+cmake-build-*/
+CMakeUserPresets.json
+
+# CMakeLists.txt pins CMAKE_RUNTIME_OUTPUT_DIRECTORY and
+# CMAKE_LIBRARY_OUTPUT_DIRECTORY here, so bin/ is generated output whichever
+# build tree produced it — including the plugin .dll/.so pair the host loads by
+# relative path, and sizes.txt, which llvm-size writes at build time.
+bin/
+
+# CMAKE_EXPORT_COMPILE_COMMANDS writes this for clangd; .cache/ is clangd's.
+compile_commands.json
+.cache/
+
+# MSVC intermediates that land outside the build tree
+*.obj
+*.pdb
+*.ilk
+*.exe
+
+# abi-probe builds with a plain Makefile under WSL, not CMake, so its output
+# lands next to its sources.
+abi-probe/abi_probe
+abi-probe/libhandler.so
