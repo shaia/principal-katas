@@ -623,6 +623,9 @@ apart again, further than in either of the others.
 
 Do steps 0–10 first; each track assumes you have an answer to defend.
 
+Answers, once you have yours: [cpp/solution.md](cpp/solution.md). The Go and Python answers are not
+written yet.
+
 | Track | What it adds |
 |---|---|
 | [**cpp/question.md**](cpp/question.md) | The only track where a slot's storage and the object in it have separate lifetimes, so "constructed" and "published" are two facts you manage by hand. Then: an ordering for every operation in the sequenced queue, what `fetch_add` actually guarantees on each instruction set, C++20's waiting primitives and what each of them lacks, and a bug-by-tool table filled in by running it. |
@@ -701,9 +704,13 @@ when the head reaches the final tail and every slot below it has been paid — a
 slots, never "empty".
 
 **Contention.** At least two contended read-modify-writes per event — the tail CAS and the head CAS —
-plus the slot's own line moving between producer and consumer. At 5 M/s that fits on one socket with
-headroom, and it does not leave much across sockets. The 2 µs p99 is at risk from 32-way arrival
-bursts on one line, and from consumers that cannot keep up — which no queue design fixes.
+plus the slot's own line moving between producer and consumer. The line itself has headroom: one
+contended `fetch_add` sustains far more than 5 M/s even at 32 threads. A CAS loop is what spends it,
+multiplying the transfers by its retries, so the reject policy's reservation is the one that runs out
+first — and a blocking push that takes a ticket instead, never retrying, is the one that keeps the
+p99. The 2 µs is also at risk from 32-way arrival bursts on one line, and from consumers that cannot
+keep up, which no queue design fixes. (This paragraph originally said 5 M/s "fits on one socket with
+headroom"; the C++ answer measured the CAS design at about 5 M/s and no more, on one socket.)
 
 **And the counter-argument that has to be made.** A mutex makes the distinction *unobservable*
 rather than representable, and answers steps 2, 5 and 8 by construction. With batching it can reach
