@@ -20,6 +20,10 @@ language tracks then ask what the shared question cannot:
 [cpp/question.md](cpp/question.md) · [go/question.md](go/question.md) ·
 [python/question.md](python/question.md).
 
+The kata stands alone. [mpsc-event-pipeline-kata](../mpsc-event-pipeline-kata/) asks the
+single-consumer version, where the shared coordination point can be removed entirely; nothing here
+requires it.
+
 ## Why three languages, when the code is C++
 
 The proposed queue is C++, but the central question is not: any bounded buffer with more than one
@@ -56,12 +60,13 @@ producers see it as full. That makes the design *blocking* in the progress sense
 anywhere. The same debt reappears as a throwing move constructor, as a reservation made after
 shutdown began, and as the producer's half of the wakeup handshake — four problems with one shape.
 
-**And what Kata 1 does not carry over.** [Kata 1](../mpsc-event-pipeline-kata/) removed its shared
-coordination point, because one consumer and per-producer ordering allowed it. Here sixteen consumers
-must find work wherever it is, and the shared head is how they do it. The contended counter is not
-overhead to design away; it is the load balancer — so the question becomes how few times each event
-touches it, and whether a mutex, which makes the reserved state unobservable rather than
-representable, already touches it few enough times.
+**And why the shared head stays.** With one consumer and order kept per producer, a queue can drop
+its shared coordination point altogether: one ring per producer, scanned by that consumer. Here
+sixteen consumers must find work wherever it is, and the shared head is how they do it. The
+contended counter is not overhead to design away; it is the load balancer — so the question becomes
+how few times each event touches it, and whether a mutex, which makes the reserved state
+unobservable rather than representable, already touches it few enough times.
+[§13](cpp/solution.md#13-the-reference-outline-checked) measures what giving it up costs.
 
 ## The answer, so far
 
@@ -130,8 +135,7 @@ the Clang bundled with Visual Studio, which this MSVC STL rejects.
 <details>
 <summary>ThreadSanitizer and the bug matrix (needs WSL)</summary>
 
-TSan is unavailable on `x86_64-pc-windows-msvc`, as in
-[mpsc-event-pipeline-kata](../mpsc-event-pipeline-kata/). Under WSL with gcc:
+TSan is unavailable on `x86_64-pc-windows-msvc`. Under WSL with gcc:
 
 ```sh
 wsl -- bash -lc 'cd /mnt/c/.../mpmc-work-queue-kata/cpp &&

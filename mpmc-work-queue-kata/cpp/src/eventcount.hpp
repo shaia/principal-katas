@@ -2,11 +2,11 @@
 //
 // The sleep half of the queue: an event count.
 //
-// Kata 1 had one consumer to wake. Here sixteen consumers sleep and thirty-two
-// producers decide, on every push, whether to wake one. So the decision must
-// cost a fence and a load when nobody is asleep — which at full rate is nearly
-// always — and the sleep itself must accept a deadline, because a blocking push
-// has one and C++20's atomic::wait cannot take one.
+// With one consumer there would be one sleeper to wake. Here sixteen consumers
+// sleep and thirty-two producers decide, on every push, whether to wake one. So
+// the decision must cost a fence and a load when nobody is asleep — which at
+// full rate is nearly always — and the sleep itself must accept a deadline,
+// because a blocking push has one and C++20's atomic::wait cannot take one.
 //
 // The protocol. A waiter reads the epoch (its key), announces itself in
 // waiters_, re-checks the condition it is about to wait for, and only then

@@ -780,8 +780,9 @@ The outline's sharpest suggestion is the experiment in its §6, and this answer 
 without running it: §11 called the shared head the load balancer.
 - **The design.** [`ShardedQueue`](src/sharded_queue.hpp) splits the 65,536 slots into 32 rings of
   2,048. Ring *p* is written only by producer *p* and drained only by consumer *p* mod 16.
-- **The ring.** It is Kata 1's single-producer ring, with a closed bit in its tail word, so a close
-  and a publication are still one decision.
+- **The ring.** It is a single-producer, single-consumer ring — free-running indices, each side
+  caching the other's, two release/acquire pairs — with a closed bit in its tail word, so a close and
+  a publication are still one decision.
 - **A push** is a load, a store into the slot, and one compare-and-swap on a line shared only with
   its own consumer.
 
@@ -933,8 +934,7 @@ push increments and wakes on, whether or not anyone sleeps. It needs no fence, a
 read-modify-write and a wake call per push (§13).
 
 **SPSC** — single-producer, single-consumer: a ring with exactly one writer and one reader, so that
-neither side needs a read-modify-write to claim a position. Kata 1's ring, and §13's one ring per
-producer.
+neither side needs a read-modify-write to claim a position. §13's one ring per producer is one.
 
 **Store buffering** — the litmus pattern in which two threads each store to one location and then
 load the other's, and both see the old values. The one reordering x86's memory model permits, and
