@@ -67,7 +67,7 @@ representable, already touches it few enough times.
 
 | | thesis |
 |---|---|
-| [**cpp/solution.md**](cpp/solution.md) | Reservation lives in the counter, publication in the slot, as a lap-stamped sequence. Two entry points on one tail word: a CAS `try_push` that can refuse, and a ticket `push` that never retries and pays a tombstone if it lands after a close. The result is **blocking in the progress sense with no lock in it** — one descheduled producer stops every consumer, and on this machine that happens six times in eight million pushes. Against the brief: tickets meet the 2 µs p99 at 16 × 8 (1.90 µs) and miss it at 32 × 16 by half (2.96 µs), on 32 CPUs that the brief's 48 threads oversubscribe. |
+| [**cpp/solution.md**](cpp/solution.md) | Reservation lives in the counter, publication in the slot, as a lap-stamped sequence. Two entry points on one tail word: a CAS `try_push` that can refuse, and a ticket `push` that never retries and pays a tombstone if it lands after a close. The result is **blocking in the progress sense with no lock in it** — one descheduled producer stops every consumer, and on this machine that happens six times in eight million pushes. Against the brief: tickets meet the 2 µs p99 at 16 × 8 (1.90 µs) and miss it at 32 × 16 by half (2.96 µs), on 32 CPUs that the brief's 48 threads oversubscribe. The question's own outline proposes one ring per producer instead. Measured in §13, that meets the p99 at 32 × 16 by giving up the shared head, so which design is right turns on whether the 32 sources are balanced. |
 | go/solution.md | not written — [go/question.md](go/question.md) |
 | python/solution.md | not written — [python/question.md](python/question.md) |
 
@@ -96,6 +96,16 @@ representable, already touches it few enough times.
 - **A mutex with 64 events per acquisition beats both lock-free arms** — 16.7 M/s against 5.30 —
   and one event per acquisition reaches 0.66 M/s. It is the right answer whenever producers naturally
   have batches. ([cpp §11](cpp/solution.md#11-when-the-mutex-is-the-better-engineering-choice))
+- **The outline's proposed experiment beats this answer on the brief's own number.** One SPSC ring
+  per producer, 2,048 slots each, at 32 × 16 and 5 M/s: push p99 224 ns, against 3.60 µs for the
+  ticket in the same phase, and no hole for a preempted producer to open. It loses what the shared
+  head did. A source sending half of 1 M/s had 72.2 % of its events refused, against none on the
+  shared ring. A flood from one source cost the other 31 sources nothing, against 30.5 % on the
+  shared ring. ([cpp §13](cpp/solution.md#13-the-reference-outline-checked))
+- **The outline's wakeup needs no fence, because it writes on every push.** An epoch advanced on
+  every push lost 0 wakeups in 80,000. It costs the producer a wake whenever a consumer sleeps: at
+  20 k/s its push p99 was 42.3 µs against the event count's 11.0 µs, and the event's own wait was
+  shorter. ([cpp §13](cpp/solution.md#13-the-reference-outline-checked))
 - **Windows throttled the benchmark to a quarter of its speed for not being in the foreground.**
   8 × 4 saturated: 2.16 M/s with EcoQoS on, 8.75 M/s off, in one run. Single-thread pinned numbers
   never moved, which is why it took a while to see.
@@ -106,8 +116,9 @@ representable, already touches it few enough times.
 ```sh
 cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="C:/Program Files/LLVM/bin/clang++.exe"
 cmake --build cpp/build
-cpp/bin/solution.exe                   # exit code is the verdict; about five minutes
+cpp/bin/solution.exe                   # exit code is the verdict; about seven minutes
 cpp/bin/solution.exe --phase 2,8       # the correctness phases only
+cpp/bin/solution.exe --phase 9         # the reference outline's alternatives
 cpp/bin/solution.exe --bug no-fence    # one row of the bug x tool table
 ```
 
@@ -139,6 +150,7 @@ an unquoted `$b` is expanded there, to nothing.
 ``` text
 mpmc-work-queue-kata/
   question.md          the kata — 11 steps, the rubric, the folded answer sketch
+  reference-outline.md the answer outline that came with the question, checked in cpp §13
   cpp/                 question.md solution.md  src/ bench/ CMakeLists.txt  -> bin/solution.exe
   go/question.md       G1–G6   the runtime already wrote it · the port without orderings · a sleep without a futex · runtime preemption · close panics · the tail
   python/question.md   P1–P6   the ceiling · reserving is publishing · read Lib/queue.py · lose the GIL · critique Queue.shutdown · multiprocessing's feeder

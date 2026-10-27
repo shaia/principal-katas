@@ -16,9 +16,11 @@
 //      the consumer's re-check saw the event, it slept and was woken, or it slept
 //      through the push and only the 2 ms backstop got it up — a lost wakeup.
 //
-//      Run twice: against the real protocol, and with the producer's fence
-//      removed (Bug::no_fence). x86 performs exactly one reordering, store then
-//      load to another address, and this is that shape.
+//      Run three times: against the real protocol, with the producer's fence
+//      removed (Bug::no_fence), and against the reference outline's protocol
+//      (Wake::epoch), which has no fence at all and should not need one. x86
+//      performs exactly one reordering, store then load to another address, and
+//      the second is that shape; the third never loads before it stores.
 
 #include "arms.hpp"
 #include "config.hpp"
@@ -40,9 +42,9 @@ struct Race {
     int recheck = 0, woken = 0, lost = 0, late = 0;
 };
 
-template <Bug B>
+template <Options O>
 Race race(const Context& ctx, int iterations, std::uint64_t spread) {
-    using Q = Queue<Event, 8, Options{.bug = B}, ParkHooks>;
+    using Q = Queue<Event, 8, O, ParkHooks>;
     ParkControl                ctl;
     ctl.spread = spread;
     auto                       q = std::make_unique<Q>(std::chrono::milliseconds(2), ParkHooks{&ctl});
@@ -112,7 +114,7 @@ int lost_wakeups_without_fence(const Context& ctx) {
     std::printf("    %-26s %6s   %9s %9s %9s %9s\n", "", "spread", "re-check", "woken", "LOST", "late");
     int lost = 0;
     for (const std::uint64_t spread : {64ull, 256ull, 1024ull, 4096ull}) {
-        const Race u = race<Bug::no_fence>(ctx, kIterations, spread);
+        const Race u = race<Options{.bug = Bug::no_fence}>(ctx, kIterations, spread);
         print_race("producer's fence removed", spread, u);
         lost += u.lost;
     }
@@ -169,19 +171,24 @@ void phase_wakeup(const Context& ctx) {
     constexpr int kIterations = 20'000;
     std::printf("\n  the engineered race, %d iterations per row, 2 ms backstop:\n", kIterations);
     std::printf("    %-26s %6s   %9s %9s %9s %9s\n", "", "spread", "re-check", "woken", "LOST", "late");
-    int fenced_lost = 0, unfenced_lost = 0;
+    int fenced_lost = 0, unfenced_lost = 0, epoch_lost = 0;
     for (const std::uint64_t spread : {64ull, 256ull, 1024ull, 4096ull}) {
-        const Race f = race<Bug::none>(ctx, kIterations, spread);
+        const Race f = race<Options{}>(ctx, kIterations, spread);
         print_race("fenced (the real protocol)", spread, f);
-        const Race u = race<Bug::no_fence>(ctx, kIterations, spread);
+        const Race u = race<Options{.bug = Bug::no_fence}>(ctx, kIterations, spread);
         print_race("producer's fence removed", spread, u);
+        const Race e = race<Options{.wake = Wake::epoch}>(ctx, kIterations, spread);
+        print_race("epoch every push, no fence", spread, e);
         fenced_lost += f.lost;
         unfenced_lost += u.lost;
+        epoch_lost += e.lost;
     }
     std::printf("    spread = the consumer's random pause before announcing itself, in loop iterations;\n"
                 "    LOST = slept through a push whose notify had returned more than 1 ms before the backstop\n");
-    std::printf("    lost wakeups: %d fenced, %d with the producer's fence removed\n", fenced_lost, unfenced_lost);
+    std::printf("    lost wakeups: %d fenced, %d with the producer's fence removed, %d with the outline's epoch\n",
+                fenced_lost, unfenced_lost, epoch_lost);
     check(fenced_lost == 0, "with both fences in place, no wakeup is ever lost");
+    check(epoch_lost == 0, "an epoch advanced on every push loses no wakeup, with no fence");
 }
 
 }  // namespace turnstile::bench

@@ -25,59 +25,15 @@
 #include "harness.hpp"
 #include "phases.hpp"
 
-#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <memory>
-#include <thread>
-#include <vector>
 
 namespace turnstile::bench {
 namespace {
 
 using Stalled  = Queue<Event, kCapacity, Options{}, StallHooks>;
 using Windowed = Queue<Event, kCapacity, Options{.measure_window = true}>;
-
-// Samples the queue's occupancy — positions reserved but not yet claimed — about
-// every 50 us while a run is going, into a timeline allocated up front, so that
-// afterwards the occupancy can be read at any moment the run reports.
-struct Monitor {
-    struct Sample {
-        std::uint64_t tsc, occupancy;
-    };
-    std::atomic<bool>   stop{false};
-    std::vector<Sample> samples;
-    std::thread         thread;
-
-    template <typename Q>
-    void start(const Q& q) {
-        samples.reserve(1 << 16);
-        thread = std::thread([this, &q] {
-            while (!stop.load(std::memory_order_acquire) && samples.size() < samples.capacity()) {
-                samples.push_back({TscClock::now(), q.reserved() - q.claimed()});
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
-            }
-        });
-    }
-    void finish() {
-        stop.store(true, std::memory_order_release);
-        thread.join();
-    }
-    std::uint64_t peak() const {
-        std::uint64_t m = 0;
-        for (const auto& x : samples) m = std::max(m, x.occupancy);
-        return m;
-    }
-    // The last sample taken at or before `t`.
-    std::uint64_t at(std::uint64_t t) const {
-        std::uint64_t v = 0;
-        for (const auto& x : samples) {
-            if (x.tsc > t) break;
-            v = x.occupancy;
-        }
-        return v;
-    }
-};
 
 }  // namespace
 

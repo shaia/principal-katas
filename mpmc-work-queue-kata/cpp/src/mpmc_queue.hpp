@@ -68,6 +68,11 @@ enum class Reserve : std::uint8_t { cas, ticket };
 // and nowhere else. Each is one line of the correct protocol made wrong.
 enum class Bug : std::uint8_t { none, relaxed_seq_load, relaxed_seq_store, no_fence, no_full_check };
 
+// How consumers sleep. event_count: a waiter count and a fence, so a push with
+// nobody asleep pays a load. epoch: the reference outline's protocol, in which
+// every push advances a shared epoch and wakes (EpochWake).
+enum class Wake : std::uint8_t { event_count, epoch };
+
 struct Options {
     Reserve reserve        = Reserve::cas;
     bool    padded         = true;   // one slot per cache line
@@ -77,6 +82,10 @@ struct Options {
     // and 5 can run the first versions beside the fixes in the same process.
     bool    coalesce_wakes   = true;  // one wake in flight per event count
     bool    batch_full_wakes = true;  // consumers wake blocked producers once per batch
+    // The reference outline's alternatives, for phase 9: its wake protocol, and
+    // consumers that spin instead of sleeping.
+    Wake    wake           = Wake::event_count;
+    bool    park           = true;
     Bug     bug            = Bug::none;
 };
 
@@ -296,6 +305,12 @@ public:
                 continue;
             }
 
+            // A consumer that never sleeps: back to the spin, holding its core.
+            if constexpr (!O.park) {
+                if (Clock::now() >= until) return Pop::timeout;
+                continue;
+            }
+
             hooks_.parking();
             const auto key = not_empty_.prepare_wait();
             // The re-check. It is exact for the slot it reads; the review of this
@@ -446,8 +461,10 @@ private:
     alignas(kCacheLine) std::unique_ptr<Slot[]> slots_;
     Nanos                                       backstop_;
     Hooks                                       hooks_;
-    BasicEventCount<O.coalesce_wakes>           not_empty_;
-    BasicEventCount<O.coalesce_wakes>           not_full_;
+    // Only the consumers' side takes the outline's protocol, so that phase 9
+    // changes one thing.
+    std::conditional_t<O.wake == Wake::epoch, EpochWake, BasicEventCount<O.coalesce_wakes>> not_empty_;
+    BasicEventCount<O.coalesce_wakes>                                                       not_full_;
 };
 
 }  // namespace turnstile

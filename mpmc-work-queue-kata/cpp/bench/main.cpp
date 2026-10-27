@@ -84,6 +84,7 @@ int main(int argc, char** argv) {
         {6, "preemption inside the window", phase_preemption},
         {7, "contention and fairness", phase_contention},
         {8, "shutdown", phase_shutdown},
+        {9, "the reference outline's alternatives", phase_outline},
     };
     // A laptop under sustained load throttles, and this one runs a vendor power
     // profile that caps sustained power: across one full run the core clock fell by

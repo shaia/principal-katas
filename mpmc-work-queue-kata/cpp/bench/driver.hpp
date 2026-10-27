@@ -52,6 +52,15 @@ struct RunSpec {
     // Close the queue this long after the start, with producers still running,
     // instead of after they have finished.
     Nanos close_after = Nanos::zero();
+
+    // Paced, in (0, 1): the fraction of `rate` that producer 0 offers, the rest
+    // split evenly among the others — one hot source, or a flood from one.
+    double hot_share = 0;
+
+    // Time each pop that finds an event at once — a non-blocking pop that
+    // succeeds — into RunResult::pop. Timing the blocking pop would count the
+    // wait for an event to arrive as the cost of taking it.
+    bool pop_latency = false;
 };
 
 struct RunResult {
@@ -71,11 +80,15 @@ struct RunResult {
     Histogram ready;  // from when the event could first have been pushed to accepted, ticks
     Histogram e2e;    // push start to pop, ticks (cross-core: phase 0 checks the TSC skew)
     Histogram window; // reserve to publish, ticks — only from a queue built with measure_window
+    Histogram pop;    // one non-blocking pop that found an event, ticks — only with pop_latency
 
     OpStats     producer_ops, consumer_ops;
     double      min_producer_rate = 0, max_producer_rate = 0;
+    double      max_consumer_rate = 0;  // the busiest consumer's events/s, over the whole run
     std::size_t producers_unfinished = 0;  // producers that ended on something other than their quota
+    std::size_t producers_refused    = 0;  // producers refused on full at least once: the blast radius
     std::uint64_t bursts = 0;              // paced: wake-ups that found events due
+    std::uint64_t hot_offered = 0, hot_rejected = 0;  // producer 0's share, for hot_share
 };
 
 namespace detail {
@@ -94,16 +107,45 @@ struct alignas(kCacheLine) ConsumerState {
     Tally                         consumed;
     std::uint64_t                 torn = 0, disorder = 0, t_last = 0;
     std::array<std::int64_t, 128> last_seq;
-    Histogram                     e2e;
+    Histogram                     e2e, pop;
     OpStats                       ops;
 };
 
+// A queue with a ring per producer, or per consumer, is told whose call it is.
 template <typename Q>
-Push push_one(Q& q, Event&& e, PushMode mode, Clock::time_point until, OpStats& st) {
-    if constexpr (requires { q.try_push(std::move(e), st); }) {
-        if (mode == PushMode::reject) return q.try_push(std::move(e), st);
+Push push_one(Q& q, Event&& e, PushMode mode, Clock::time_point until, OpStats& st, int id) {
+    if constexpr (requires { q.push(std::move(e), until, st, id); }) {
+        if (mode == PushMode::reject) return q.try_push(std::move(e), st, id);
+        return q.push(std::move(e), until, st, id);
+    } else {
+        if constexpr (requires { q.try_push(std::move(e), st); }) {
+            if (mode == PushMode::reject) return q.try_push(std::move(e), st);
+        }
+        return q.push(std::move(e), until, st);
     }
-    return q.push(std::move(e), until, st);
+}
+
+template <typename Q>
+Pop pop_one(Q& q, Event& e, Clock::time_point until, OpStats& st, int id) {
+    if constexpr (requires { q.pop(e, until, st, id); }) return q.pop(e, until, st, id);
+    else return q.pop(e, until, st);
+}
+
+template <typename Q>
+Pop try_pop_one(Q& q, Event& e, OpStats& st, int id) {
+    if constexpr (requires { q.try_pop(e, st, id); }) return q.try_pop(e, st, id);
+    else if constexpr (requires { q.try_pop(e, st); }) return q.try_pop(e, st);
+    else return Pop::empty;
+}
+
+// Positions reserved but not yet claimed. The two counters are read one after
+// the other, so the claimed count can have moved past the reserved one it is
+// subtracted from; that reads as empty rather than as 2^64.
+template <typename Q>
+std::uint64_t occupancy(const Q& q) {
+    const std::uint64_t reserved = q.reserved();
+    const std::uint64_t claimed  = q.claimed();
+    return reserved > claimed ? reserved - claimed : 0;
 }
 
 template <typename Q>
@@ -131,6 +173,14 @@ template <typename Q>
 RunResult run(Q& q, const RunSpec& spec, const Context& ctx) {
     using namespace detail;
     const int P = spec.producers, C = spec.consumers;
+    // A queue with a ring per producer is built for one pair of thread counts:
+    // more producers would index past its rings, fewer consumers leave rings unserved.
+    if constexpr (requires { Q::kRingProducers; }) {
+        if (P != Q::kRingProducers || C != Q::kRingConsumers) {
+            check(false, "the run's thread counts are the ones the queue's rings were built for");
+            return {};
+        }
+    }
     auto      ps = std::make_unique<ProducerState[]>(static_cast<std::size_t>(P));
     auto      cs = std::make_unique<ConsumerState[]>(static_cast<std::size_t>(std::max(C, 1)));
 
@@ -143,8 +193,16 @@ RunResult run(Q& q, const RunSpec& spec, const Context& ctx) {
 
     const std::uint64_t work = spec.consumer_work_ns > 0 ? ctx.clk.ticks(spec.consumer_work_ns) : 0;
     const bool          paced = spec.rate > 0;
-    const std::uint64_t interval =
-        paced ? ctx.clk.ticks(1e9 * static_cast<double>(P) / spec.rate) : 0;
+    // Each producer's spacing between events: an equal share of the rate, unless
+    // producer 0 is the hot one.
+    check(spec.hot_share < 1, "hot_share leaves the other producers a share of the rate");
+    auto interval_of = [&](int id) -> std::uint64_t {
+        if (!paced) return 0;
+        if (spec.hot_share <= 0 || spec.hot_share >= 1 || P < 2)
+            return ctx.clk.ticks(1e9 * static_cast<double>(P) / spec.rate);
+        const double share = id == 0 ? spec.hot_share : (1 - spec.hot_share) / static_cast<double>(P - 1);
+        return ctx.clk.ticks(1e9 / (spec.rate * share));
+    };
     const std::uint64_t duration = paced ? ctx.clk.ticks(spec.seconds * 1e9) : 0;
     std::uint64_t       t_go     = 0;
     std::atomic<std::uint64_t> t_go_shared{0};
@@ -159,6 +217,7 @@ RunResult run(Q& q, const RunSpec& spec, const Context& ctx) {
             const PushMode      mode =
                 spec.mode == PushMode::mixed ? (id % 2 ? PushMode::block : PushMode::reject) : spec.mode;
             std::vector<Event>  batch(spec.batch);
+            const std::uint64_t interval = interval_of(id);
             s.ops.window = &s.window;
             wait_go();
             const std::uint64_t start = t_go_shared.load(std::memory_order_acquire);
@@ -166,7 +225,7 @@ RunResult run(Q& q, const RunSpec& spec, const Context& ctx) {
 
             auto push_timed = [&](std::uint32_t seq, std::uint64_t ready_at) -> Push {
                 const std::uint64_t t0 = TscClock::now();
-                Push r = push_one(q, make_event(pid, seq, t0), mode, until, s.ops);
+                Push r = push_one(q, make_event(pid, seq, t0), mode, until, s.ops, id);
                 const std::uint64_t t1 = TscClock::now();
                 if (spec.latency) {
                     s.push.record(t1 - t0);
@@ -265,8 +324,16 @@ RunResult run(Q& q, const RunSpec& spec, const Context& ctx) {
                         continue;
                     }
                 }
-                Event     ev;
-                const Pop r = q.pop(ev, forever, s.ops);
+                Event ev;
+                if (spec.pop_latency) {
+                    const std::uint64_t t0 = TscClock::now();
+                    if (try_pop_one(q, ev, s.ops, id) == Pop::ok) {
+                        s.pop.record(TscClock::now() - t0);
+                        take(ev);
+                        continue;
+                    }
+                }
+                const Pop r = pop_one(q, ev, forever, s.ops, id);
                 if (r == Pop::drained) break;
                 if (r == Pop::ok) take(ev);
             }
@@ -282,13 +349,13 @@ RunResult run(Q& q, const RunSpec& spec, const Context& ctx) {
     out.t_go = t_go;
     if (spec.close_after > Nanos::zero()) {
         std::this_thread::sleep_for(spec.close_after);
-        if constexpr (requires { q.reserved(); }) out.backlog_at_close = q.reserved() - q.claimed();
+        if constexpr (requires { q.reserved(); }) out.backlog_at_close = occupancy(q);
         out.t_close = TscClock::now();
         q.close();
         for (auto& t : threads) t.join();
     } else {
         for (int i = 0; i < P; ++i) threads[static_cast<std::size_t>(i)].join();
-        if constexpr (requires { q.reserved(); }) out.backlog_at_close = q.reserved() - q.claimed();
+        if constexpr (requires { q.reserved(); }) out.backlog_at_close = occupancy(q);
         out.t_close = TscClock::now();
         q.close();
         for (std::size_t i = static_cast<std::size_t>(P); i < threads.size(); ++i) threads[i].join();
@@ -307,6 +374,7 @@ RunResult run(Q& q, const RunSpec& spec, const Context& ctx) {
         out.window.merge(s.window);
         out.producer_ops.merge(s.ops);
         if (!s.finished_quota) ++out.producers_unfinished;
+        if (s.rejected) ++out.producers_refused;
         out.bursts += s.bursts;
         if (s.first_full && (out.first_full == 0 || s.first_full < out.first_full)) out.first_full = s.first_full;
         const double secs = ctx.clk.to_ns(s.t_done - t_go) / 1e9;
@@ -314,12 +382,15 @@ RunResult run(Q& q, const RunSpec& spec, const Context& ctx) {
         out.min_producer_rate = std::min(out.min_producer_rate, r);
         out.max_producer_rate = std::max(out.max_producer_rate, r);
     }
+    out.hot_offered  = ps[0].offered;
+    out.hot_rejected = ps[0].rejected;
     for (int i = 0; i < C; ++i) {
         const ConsumerState& s = cs[static_cast<std::size_t>(i)];
         consumed.merge(s.consumed);
         out.torn += s.torn;
         out.disorder += s.disorder;
         out.e2e.merge(s.e2e);
+        out.pop.merge(s.pop);
         out.consumer_ops.merge(s.ops);
         out.t_end = std::max(out.t_end, s.t_last);
     }
@@ -328,8 +399,53 @@ RunResult run(Q& q, const RunSpec& spec, const Context& ctx) {
     out.exactly_once = C > 0 && accepted == consumed && out.torn == 0;
     out.seconds      = out.t_end > t_go ? ctx.clk.to_ns(out.t_end - t_go) / 1e9 : 0;
     out.rate         = out.seconds > 0 ? static_cast<double>(out.consumed) / out.seconds : 0;
+    for (int i = 0; i < C && out.seconds > 0; ++i)
+        out.max_consumer_rate =
+            std::max(out.max_consumer_rate, static_cast<double>(cs[static_cast<std::size_t>(i)].consumed.n) / out.seconds);
     return out;
 }
+
+// Samples the queue's occupancy while a run is going, into a timeline allocated
+// up front, so that afterwards the occupancy can be read at any moment the run
+// reports. It asks to sleep 50 us between samples; on Windows a sleep lasts
+// about a millisecond, which is the timeline's real resolution there.
+struct Monitor {
+    struct Sample {
+        std::uint64_t tsc, occupancy;
+    };
+    std::atomic<bool>   stop{false};
+    std::vector<Sample> samples;
+    std::thread         thread;
+
+    template <typename Q>
+    void start(const Q& q) {
+        samples.reserve(1 << 16);
+        thread = std::thread([this, &q] {
+            while (!stop.load(std::memory_order_acquire) && samples.size() < samples.capacity()) {
+                samples.push_back({TscClock::now(), detail::occupancy(q)});
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        });
+    }
+    void finish() {
+        stop.store(true, std::memory_order_release);
+        thread.join();
+    }
+    std::uint64_t peak() const {
+        std::uint64_t m = 0;
+        for (const auto& x : samples) m = std::max(m, x.occupancy);
+        return m;
+    }
+    // The last sample taken at or before `t`.
+    std::uint64_t at(std::uint64_t t) const {
+        std::uint64_t v = 0;
+        for (const auto& x : samples) {
+            if (x.tsc > t) break;
+            v = x.occupancy;
+        }
+        return v;
+    }
+};
 
 // The invariants every run must satisfy, under shared labels.
 inline void check_run(const RunResult& r, const std::string& label) {

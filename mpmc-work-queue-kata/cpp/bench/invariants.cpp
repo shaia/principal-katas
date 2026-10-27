@@ -5,6 +5,9 @@
 // consumed exactly once; nothing is read torn or unpublished; and from each
 // consumer's point of view each producer's events arrive in order.
 //
+// The reference outline's alternatives are held to the same: its epoch wake,
+// consumers that spin, and one SPSC ring per producer.
+//
 // Then the same against a 4-slot ring with eight producers and eight consumers,
 // which wraps every few operations. At 65,536 slots a lap takes thousands of
 // operations and a bug in the lap encoding has to wait for its moment; at four,
@@ -46,10 +49,14 @@ void phase_invariants(const Context& ctx) {
     one<Packed>(ctx, "turnstile (CAS, packed slots)", full);
     one<Ticket>(ctx, "ticket (fetch_add)", full);
     one<Locked>(ctx, "mutex + 2 condvars", full);
+    one<Outline>(ctx, "outline (CAS + epoch wake)", full);
+    one<Spinning>(ctx, "turnstile, consumers spin", full);
+    one<PerProducer>(ctx, "per-producer SPSC rings", full);
 
     RunSpec reject = full;
     reject.mode    = PushMode::reject;
     one<Turnstile>(ctx, "turnstile, reject on full", reject);
+    one<PerProducer>(ctx, "per-producer, reject on full", reject);
     RunSpec mixed = full;
     mixed.mode    = PushMode::mixed;
     one<Ticket>(ctx, "ticket + CAS on one word", mixed);
@@ -68,6 +75,16 @@ void phase_invariants(const Context& ctx) {
     one<Queue<Event, 4, Options{.reserve = Reserve::ticket}>>(ctx, "4-slot ring, ticket + CAS", wrap);
     wrap.mode = PushMode::block;
     one<Queue<Event, 4, Options{.padded = false}>>(ctx, "4-slot ring, packed", wrap);
+    one<Queue<Event, 4, Options{.wake = Wake::epoch}>>(ctx, "4-slot ring, epoch wake", wrap);
+
+    // Eight 2-slot rings, one per producer: each wraps every other push.
+    using TinyRings = ShardedQueue<Event, 16, 8, 8>;
+    wrap.mode       = PushMode::reject;
+    one<TinyRings>(ctx, "2-slot rings x 8, reject", wrap);
+    wrap.mode = PushMode::block;
+    one<TinyRings>(ctx, "2-slot rings x 8, block", wrap);
+    wrap.mode = PushMode::mixed;
+    one<TinyRings>(ctx, "2-slot rings x 8, mixed", wrap);
 }
 
 }  // namespace turnstile::bench
