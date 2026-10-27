@@ -558,8 +558,9 @@ case for a design in which nobody can observe the difference.
   slot reserver — compare the blast radius, not the mechanism
 - what batching does to the mutex's arithmetic: how many events per acquisition reach 5 M/s, and
   what a batch API means for a producer that only ever has one event in hand
-- the sharded alternative — one queue per consumer: what it fixes, and the requirement it breaks.
-  Then say what the single shared head was actually providing that the shards do not
+- the sharded alternatives — one queue per producer, or one per consumer: what each fixes, and the
+  requirement it breaks. Then say what the single shared head was actually providing that the shards
+  do not, and what happens under each to every other source when one source floods
 - how many protocols a maintainer must hold in their head for each design, and which of them a
   reviewer would notice being broken
 - what would have to be true of your system for the per-slot design to be the wrong engineering call
@@ -624,7 +625,9 @@ apart again, further than in either of the others.
 Do steps 0–10 first; each track assumes you have an answer to defend.
 
 Answers, once you have yours: [cpp/solution.md](cpp/solution.md). The Go and Python answers are not
-written yet.
+written yet. The answer outline that came with the question is in
+[reference-outline.md](reference-outline.md), and
+[cpp §13](cpp/solution.md#13-the-reference-outline-checked) checks it against measurements.
 
 | Track | What it adds |
 |---|---|
@@ -715,6 +718,10 @@ headroom"; the C++ answer measured the CAS design at about 5 M/s and no more, on
 **And the counter-argument that has to be made.** A mutex makes the distinction *unobservable*
 rather than representable, and answers steps 2, 5 and 8 by construction. With batching it can reach
 the throughput. What it cannot do is keep a preempted thread from blocking everyone. The shared head
-that both designs keep is not overhead: with sixteen consumers, it is the load balancer.
+that both designs keep is not overhead: with sixteen consumers, it is the load balancer. It is also a
+shared fate. The C++ answer later ran the alternative the question's own outline proposes, one ring
+per producer: it met the p99 the shared head missed, refused most of a source busier than one
+consumer, and left a flood from one source unable to touch the other 31
+([cpp §13](cpp/solution.md#13-the-reference-outline-checked)).
 
 </details>

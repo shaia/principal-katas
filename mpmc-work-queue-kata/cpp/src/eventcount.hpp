@@ -137,4 +137,62 @@ private:
 
 using EventCount = BasicEventCount<true>;
 
+// The reference outline's protocol, kept to be measured beside the event count:
+// every notify advances the epoch and wakes, whether or not anyone is asleep.
+//
+// It needs no fence, and the unconditional increment is the reason. The epoch's
+// modification order is total, and the waiter reads its key before re-checking.
+// If that key already includes a producer's increment, the waiter's acquire load
+// synchronizes with the producer's release RMW (or with one later in its release
+// sequence), so the re-check sees the publication made before it. If it does
+// not, the increment comes after the key in that order, and the wait either sees
+// the epoch changed or is woken by the wake that follows it — which rests on the
+// OS wait comparing the word and blocking as one step, as atomic::wait's does.
+// The store-buffering race the event count fences against needs a notifier that
+// loads before deciding to store; this one always stores.
+//
+// What it costs instead is a read-modify-write of one shared line, and a wake
+// call, on every push. The outline writes it with atomic::wait and notify_one;
+// this uses wait_on and wake_one, because atomic::wait cannot take the backstop,
+// and libstdc++'s notify skips a futex waiter its own wait did not register.
+class EpochWake {
+public:
+    using Key = std::uint32_t;
+
+    Key  prepare_wait() noexcept { return epoch_.load(std::memory_order_acquire); }
+    void cancel_wait() noexcept {}
+
+    bool wait(Key key, Clock::time_point until) noexcept {
+        while (epoch_.load(std::memory_order_acquire) == key) {
+            const auto now = Clock::now();
+            if (now >= until) return false;
+            wait_on(epoch_, key, std::chrono::duration_cast<Nanos>(until - now));
+        }
+        return true;
+    }
+
+    template <bool Fenced = true>
+    bool notify_one() noexcept {
+        epoch_.fetch_add(1, std::memory_order_release);
+        wake_one(epoch_);
+        return true;
+    }
+
+    template <bool Fenced = true>
+    bool notify_all_if_waiting() noexcept {
+        notify_all();
+        return true;
+    }
+
+    void notify_all() noexcept {
+        epoch_.fetch_add(1, std::memory_order_release);
+        wake_all(epoch_);
+    }
+
+    std::uint32_t waiters() const noexcept { return 0; }  // nobody is counted
+
+private:
+    alignas(kCacheLine) std::atomic<std::uint32_t> epoch_{0};
+};
+
 }  // namespace turnstile

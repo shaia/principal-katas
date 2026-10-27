@@ -1,6 +1,6 @@
 #pragma once
 //
-// The nine phases, one per translation unit, plus the deliberate-bug mode. Each
+// The ten phases, one per translation unit, plus the deliberate-bug mode. Each
 // prints its own results and registers failures via harness check().
 
 #include "harness.hpp"
@@ -56,6 +56,11 @@ void phase_contention(const Context& ctx);
 // 8. Shutdown: close under load with blocked producers and a full queue, and a
 //    close while a producer is stalled inside its window.
 void phase_shutdown(const Context& ctx);
+
+// 9. The reference outline's alternatives, beside the queue: its epoch wake, one
+//    SPSC ring per producer, and consumers that spin — at the brief's rate,
+//    asleep, idle, and where one ring per producer breaks and where it wins.
+void phase_outline(const Context& ctx);
 
 // --bug <name>: one deliberate bug from the C++ track's step C5, under the stress
 // meant to expose it. Returns 1 if the stress detected it, 0 if it passed.

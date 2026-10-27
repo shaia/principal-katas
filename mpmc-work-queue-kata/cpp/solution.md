@@ -8,8 +8,10 @@ questions are at [../go/question.md](../go/question.md) and
 Every number below came from running [`bin/solution.exe`](bench/), whose exit code is the verdict,
 on an i9-13980HX laptop (8 P-cores, 16 E-cores, 32 logical CPUs, one socket) under Windows 11 with
 clang 21.1.7; the ThreadSanitizer figures came from the same sources built with gcc 13.3 under WSL.
-Unless a section says otherwise, figures are from one full run, the second of two back to back. Terms
-of art (TSO, EcoQoS, LL/SC, …) are expanded in the [Glossary](#appendix-glossary).
+Unless a section says otherwise, figures are from one full run, the second of two back to back; §13's
+come from a later pair of runs, made once the reference outline's alternatives had been added, and are
+compared only with each other. Terms of art (TSO, EcoQoS, LL/SC, SPSC, …) are expanded in the
+[Glossary](#appendix-glossary).
 
 ---
 
@@ -102,14 +104,15 @@ single-thread pinned measurement. (→ §12)
 | Does it meet the brief? | §10 |
 | When to ship the mutex | §11 |
 | Verification, and what this platform cannot measure | §12 |
+| The reference outline, checked; one ring per producer, measured | §13 |
 
 ## Layout
 
 ``` text
 cpp/
   src/    platform (TSC clock, timed wait-on-address, EcoQoS), the event, the brief's queue verbatim,
-          the event count, turnstile::Queue, the mutex arm
-  bench/  nine phases, one per translation unit, plus --bug  -> bin/solution.exe
+          the event count, turnstile::Queue, the mutex arm, one SPSC ring per producer (§13)
+  bench/  ten phases, one per translation unit, plus --bug  -> bin/solution.exe
 ```
 
 Run it:
@@ -117,7 +120,7 @@ Run it:
 ```sh
 cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="C:/Program Files/LLVM/bin/clang++.exe"
 cmake --build cpp/build
-cpp/bin/solution.exe                      # exit code is the verdict; about five minutes; run twice, see §12
+cpp/bin/solution.exe                      # exit code is the verdict; about seven minutes; run twice, see §12
 cpp/bin/solution.exe --bug no-fence       # one row of the bug x tool table (§12)
 ```
 
@@ -175,6 +178,12 @@ six times in eight million pushes.
 **A mutex and two condition variables** makes the distinction unobservable rather than
 representable, and answers the wakeup and shutdown questions by construction. §11 measures it and
 says when it wins.
+
+**One SPSC ring per producer** removes the shared counter, and with it the producers' contention
+and the hole a preempted producer opens for everyone. The reference outline proposes benchmarking
+it, and §13 does: it meets the brief's p99 where this design does not, and it gives up the shared
+head, so a source busier than one consumer loses events while the others sit idle. Which of the two
+the brief wants turns on a fact it does not state: whether its 32 sources are balanced.
 
 ---
 
@@ -564,6 +573,10 @@ CPUs, meets it. With 48 threads on 32 CPUs the tail is set by the scheduler, whi
 descheduling producers inside their windows. On a 48-core server the question is open, and the
 number to measure first is the one in §7.
 
+The reference outline's alternative, one SPSC ring per producer, does meet it at 32 × 16. Measured
+beside the ticket in a later run (§13), its push p99 was 224 ns against the ticket's 3.60 µs, and
+what it gave up to get there is in the same section.
+
 ---
 
 ## 11. When the mutex is the better engineering choice
@@ -593,7 +606,8 @@ ring buffer does — when per-event tail latency is not the requirement, and whe
 maintain this would rather review twenty lines of monitor than this document. The per-slot design is
 the right call when the requirement is the brief's: single events, a per-push p99, and thread counts
 that make one lock the bottleneck. With sixteen consumers, both keep a shared head — and that is not
-overhead in either: it is the load balancer.
+overhead in either: it is the load balancer. §13 removes it, and measures both what that costs and
+what it buys.
 
 ---
 
@@ -626,7 +640,8 @@ and the TSan build silences that warning with a comment saying why. So the wakeu
 place the design depends on a fence — is the one place TSan cannot judge in either direction, and the
 x86 stress test, the weakest instrument in the table for everything else, is the one that catches it.
 
-Under TSan the correctness phases (2 and 8) run clean, with event counts divided by twenty.
+Under TSan the correctness phases (2 and 8) run clean, with event counts divided by twenty, and
+still do with the reference outline's alternatives added to both (§13).
 
 An independent review of the queue and the event count, done by reading and constructing
 interleavings rather than by running anything, found no bug in the protocol and two bounded-latency
@@ -678,8 +693,221 @@ was due rather than from when it was pushed, so that it is not hidden.
 - Ticket holders sleep on a 200 µs timer (a millisecond, after Windows rounds it) once their spin
   and yields run out; a full queue's latency is set by its consumers anyway, and a precise per-slot
   wake would cost a wake per release.
-- Per-entity ordering (§7) is not provided and not measured.
+- Per-entity ordering (§7) is not provided by the shared queue. One ring per producer provides it
+  per source (§13); neither is measured beyond the per-consumer order check.
 - The FIFO-versus-processing-order inversion count was planned and not built.
+- Work stealing between per-producer rings, the fix for §13's hot source, is not built.
+
+---
+
+## 13. The reference outline, checked
+
+The question came with an answer outline, reproduced in
+[../reference-outline.md](../reference-outline.md). On the slot protocol, it and this document give
+the same answer:
+- a sequence per slot that takes the values *p*, *p* + 1 and *p* + *N*;
+- a release store after construction, against an acquire load before reading;
+- a second pair for the slot's return;
+- a relaxed reservation;
+- nothing in the window that can throw.
+
+Wherever the outline differs from this answer, or names a measurement this answer had not made,
+this section runs it. The figures come from phases 5 and 9 of a later pair of full runs, the second
+of the pair; phase 9 ran with the clock fully up (a pause read 32 ns). They are compared only with
+each other.
+
+### Claim by claim
+
+| The outline | Verdict | Evidence |
+|---|---|---|
+| **A.** A consumer can read slot 42 before it is written; there is no capacity check; `head.fetch_add` hands out positions that are no longer valid | confirmed | §2: 11.4 % lost, 90,192 delivered twice, 1,030 torn |
+| **B.** A sequence per slot: wait for *P*, construct, store *P* + 1; consume, store *P* + *N* | the same protocol | §1, §3 |
+| **B.** "Indices are advanced using CAS operations only after verifying the relevant slot state", and "an enqueue must return full rather than blindly reserving a ticket" | **right for reject; refuted for block** | A ticket that waits for its own slot cannot overwrite anything. At 5 M/s its push p99 was 3.60 µs against the CAS's 30.5 µs (below); §5 has the retries. The brief's bug was announcing the position through the counter, not taking a ticket |
+| **C.** The ticket can be relaxed, but "the algorithm must separately prove that no two threads simultaneously own the same slot" | confirmed, and the proof is the lap | §3. One counter operation claims each position, and a slot is reused only once its sequence says the previous lap released it. Phase 2's 4-slot ring wraps every few operations to test exactly that |
+| **C.** Throwing constructors need "an explicit failure protocol" | agreed, and chosen differently | §4: forbidden at compile time, because a reservation is a debt and an exception defaults on it |
+| **4.** An epoch advanced and notified on every push removes the lost wakeup | **confirmed, and it needs no fence** | 0 lost in 80,000 iterations of phase 5's engineered race. Why, and what it costs, below |
+| **5.** A preempted producer blocks the consumers and eventually fills the queue; having no mutex does not make a queue lock-free | confirmed | §7: first refusal 63.5 ms after a producer stalled. The outline has only the producer's half: a stalled consumer fills the queue with 833 events in it |
+| **6.** Mutex and condition variable: "contention and blocking" | incomplete | §11: one event per lock reached 0.66 M/s, and 64 per lock 16.7 M/s, the fastest shared arm measured |
+| **6.** Per-producer SPSC queues: "excellent locality … consumer aggregation and balancing", and "I would also benchmark 32 producer-local SPSC queues" | **run; both halves confirmed** | Below. It meets the brief's p99 at 32 × 16, and it loses most of a hot source |
+| **6.** Spin waiting: "low wakeup latency; CPU consumption". Atomic wait/notify: "efficient idle behavior; wakeup latency" | confirmed, and priced | Below: idle consumers cost 15.5 CPUs spinning, under a hundredth of one parked |
+| **7.** Six invariants | each one asserted | The table below |
+| **7.** Measure throughput, enqueue and dequeue p50/p99, CAS retries, occupancy, how often the queue is full, wakeup latency, and idle CPU | all measured | Dequeue latency and idle CPU are new in this section; the rest are §§5–10 |
+
+The outline also leaves out three things, each of which changed a number here:
+- **Slot padding**, worth 49 % of throughput (§4).
+- **The futex word is 32 bits.** On Linux a futex compares 32 bits, so the outline's
+  `std::atomic<uint64_t>` epoch cannot be the word the kernel compares, and the library waits on a
+  proxy for it.
+- **`atomic::wait` takes no deadline**, so neither a blocking push with a timeout nor a backstop can
+  be built on it (§6).
+
+### The wake protocol: correct without a fence, and what it costs
+
+The event count in §6 needs a fence on each side because its producer *loads* the waiter count
+before deciding whether to store anything. That is the store-buffering shape. The outline's producer
+never decides: it increments the epoch on every push, a read-modify-write on the location the
+sleeper read its key from. Either the key already includes that increment, or it does not:
+- **If it does,** the sleeper's acquire load synchronizes with the producer's release, and the
+  re-check sees the event.
+- **If it does not,** the epoch has moved past the key, and the wait, which compares and blocks as
+  one step, returns or is woken.
+
+[`EpochWake`](src/eventcount.hpp) is that protocol with a timed wait in place of `atomic::wait`.
+Phase 5's engineered race ran it beside the event count, and it lost nothing at any spread: 0 in
+80,000. In the same phase, the event count with its fence removed lost 3.
+
+What it costs is a read-modify-write on one more shared line, and a wake call, on every push. Both
+arms below reserve by CAS, interleaved, median of three:
+
+| consumers wait by | rate | wake calls per push | push p99 | end-to-end p50 | end-to-end p99 |
+|---|---|---|---|---|---|
+| event count | 20 k/s | 0.0618 | 11.0 µs | 40.6 µs | 196 µs |
+| epoch, every push | 20 k/s | 1.00 | 42.3 µs | 6.77 µs | 54.2 µs |
+| event count | 5 M/s | 0.0287 | 30.5 µs | — | 18.2 ms |
+| epoch, every push | 5 M/s | 1.00 | 30.5 µs | — | 15.6 ms |
+
+**At the brief's rate the extra line disappears** into the CAS loop's own contention: the two p99s
+are the same, and saturated the outline's queue ran at 4.05 M/s against 4.25.
+
+**At low load it is §6's first event count again**, a wake on every push that finds a sleeper. The
+trade is the same one as §6's: the producer's p99 four times worse, and the event's wait for a
+consumer three to six times shorter. The outline's protocol is correct and simpler. This answer
+keeps the event count because the brief's requirement is on the push.
+
+### One ring per producer
+
+The outline's sharpest suggestion is the experiment in its §6, and this answer had argued against it
+without running it: §11 called the shared head the load balancer.
+- **The design.** [`ShardedQueue`](src/sharded_queue.hpp) splits the 65,536 slots into 32 rings of
+  2,048. Ring *p* is written only by producer *p* and drained only by consumer *p* mod 16.
+- **The ring.** It is Kata 1's single-producer ring, with a closed bit in its tail word, so a close
+  and a publication are still one decision.
+- **A push** is a load, a store into the slot, and one compare-and-swap on a line shared only with
+  its own consumer.
+
+At the brief's rate: 32 × 16 at 5 M/s, consumers spending 1 µs per event, interleaved, median of
+three.
+
+| | push p50 | **push p99** | p99.9 | pop p50 | pop p99 | behind schedule, p99 | end-to-end p99 |
+|---|---|---|---|---|---|---|---|
+| the outline's queue (CAS + epoch) | 2.12 µs | 30.5 µs | 81.3 µs | 476 ns | 13.1 µs | 305 ms | 15.6 ms |
+| turnstile (CAS) | 2.65 µs | 30.5 µs | 129 µs | 476 ns | 16.9 µs | 430 ms | 18.2 ms |
+| ticket | 1.59 µs | 3.60 µs | 12.7 µs | 1.16 µs | 9.74 µs | 9.97 ms | 14.7 ms |
+| **one ring per producer** | 62 ns | **224 ns** | 149 µs | 16 ns | 51 ns | 975 µs | 4.98 ms |
+
+"Pop" is a non-blocking pop that found an event: the dequeue's own cost. The outline's measurement
+list asks for it, and §§3–10 had not reported it. Saturated, one ring per producer moved 77.0 M/s,
+against 6.72 M/s for the ticket and 4.25 M/s for the CAS.
+
+**It is the only arm that meets the brief's 2 µs at 32 × 16**, by a factor of nine, on the machine
+where the shared ring missed it. Its p99.9, 149 µs, is a tail this phase does not take apart.
+Whatever it is, it delays one ring's events and nobody else's.
+
+**There is no hole for anyone else to wait behind.** One thread stalled for 100 ms at overall
+position 200,000; 1 M/s offered, consumers spending 1 µs per event, reject on full:
+
+| stalled | queue | first refusal | producers refused | occupancy then | refused | end-to-end p99 |
+|---|---|---|---|---|---|---|
+| a producer | shared (CAS) | 63.6 ms | 32 of 32 | 61,268 | 6.0 % | 111 ms |
+| a producer | one ring per producer | 109 ms | 1 of 32 | 3,771 | 0.2 % | 1.14 ms |
+| a consumer | shared (CAS) | 62.8 ms | 32 of 32 | 490 | 8.1 % | 2.71 ms |
+| a consumer | one ring per producer | 61.5 ms | 2 of 32 | 10,847 | 0.5 % | 1.19 ms |
+
+**A stalled producer delays only its own ring.** The consumer that owns that ring keeps serving its
+other one, and the other fifteen consumers never notice. The one producer refused is the stalled
+one: when it came back, it had 100 ms of events for 2,048 slots, and it refused its own backlog at
+109 ms.
+
+**A stalled consumer blocks its two rings and their two producers, and nobody else.** Those two are
+refused after the same *N* / rate as on the shared ring, because each ring holds 1/32 of the slots
+and receives 1/32 of the traffic. This is the head-of-line blocking of §7, confined to whoever
+shares the stalled thread's ring.
+
+**And then what the shared head was doing.** In both runs below, consumers spend 4 µs per event, so
+sixteen of them can take 4 M/s and one can take 0.25 M/s. Reject on full, interleaved, median of
+three:
+
+| | queue | source 0 refused | the other 31 refused | consumed | end-to-end p99 |
+|---|---|---|---|---|---|
+| **a hot source:** 1 M/s, half of it from source 0 | shared (CAS) | 0.0 % | 0.0 % | 0.98 M/s | 2.93 ms |
+| | one ring per producer | **72.2 %** | 0.0 % | 0.62 M/s | 9.54 ms |
+| **a flood:** 8 M/s, 94 % of it from source 0 | shared (CAS) | 44.8 % | **30.5 %** | 3.65 M/s | 18.7 ms |
+| | one ring per producer | 97.2 % | **0.0 %** | 0.69 M/s | 9.54 ms |
+
+**Within capacity**, the shared ring refused nothing. One ring per producer refused nearly three
+quarters of source 0, with fifteen consumers mostly idle. Arithmetic says it must refuse at least
+half: 0.5 M/s is offered to the one consumer allowed to take it, at 4 µs an event. That consumer
+delivered 0.15 M/s, below even the 0.25 M/s its work allows, and this phase does not separate why.
+
+**Past capacity, the shared ring spread the loss.** Each of the other sources sends about one event
+in five hundred, and they lost 30.5 % of theirs, because the flood had filled the queue they share.
+One ring per producer confined it: the flood lost 97.2 %, and nobody else lost anything.
+
+**That is one property under two names.** The shared head is the load balancer §11 called it:
+capacity and consumers go wherever the events are. It is also a shared fate: whatever fills it fills
+it for everyone. For a security agent the second name matters as much as the first. §5's drop that
+an attacker can schedule is exactly the flood row, and with one ring per producer, a source that
+floods to hide something blinds only itself.
+
+At the lowest rate, one ring per producer also pays for having a sleeper per consumer. No wake in
+flight is shared across consumers, so a push found its consumer asleep more often: 0.0942 wake calls
+per push at 20 k/s, against the shared event count's 0.0618, and a push p99 of 24.5 µs against
+11.0 µs.
+
+### Spinning against sleeping
+
+| consumers wait by | CPUs busy while idle | push p99 at 20 k/s | end-to-end p99 at 20 k/s |
+|---|---|---|---|
+| event count | 0.0077 | 11.0 µs | 196 µs |
+| epoch, every push | 0.0085 | 42.3 µs | 54.2 µs |
+| spinning | **15.5** | 1.53 µs | **5.71 µs** |
+| one ring per producer, an event count each | 0.0066 | 24.5 µs | 129 µs |
+
+- **Parking costs under a hundredth of a CPU.** Sixteen idle consumers that park wake only at their
+  backstops, about sixteen times a second each.
+- **Spinning costs fifteen and a half CPUs.** It is the only way to wait here that keeps both the push
+  and the event's wait at low load inside the brief's 2 µs, and it does so by keeping sixteen cores
+  busy doing nothing.
+- **The outline's table is right in every cell; these are the sizes.**
+
+The CPU figure comes from the process's cycle accounting, checked first against a thread kept busy
+for 200 ms, which read 198.2 ms.
+
+### The six invariants, and what asserts each
+
+| the outline's invariant | asserted by |
+|---|---|
+| 1. Every accepted event has exactly one owning slot | exactly-once on every run, using two independent hash sums of identity plus counts (§12). This includes a 4-slot ring and eight 2-slot rings that wrap every few operations |
+| 2. Consumers never access unpublished elements | a digest in every event, checked on every pop; and ThreadSanitizer, for the orderings x86 hides (§12) |
+| 3. Slots are never reused before their previous elements are consumed | the second release/acquire pair (§3). Removing the full check hangs the stress, and TSan reports it (§12) |
+| 4. Queue capacity is always bounded | exactly 65,536 accepted with no consumer (§5) |
+| 5. Shutdown refuses new reservations, lets accepted ones finish, and drains everything committed | phase 8. Close under load on every arm: every producer refused, and consumed equal to accepted. A close during a producer's stall. Close-versus-reserve hammered on the CAS, ticket and per-producer queues |
+| 6. Sleeping consumers always observe new work or shutdown | the engineered race (§6, and the epoch above); a watchdog on every shutdown; backstop expiries counted |
+
+The driver also asserts one invariant the outline does not list: from each consumer's point of
+view, each producer's events arrive in order. With one ring per producer, that becomes "each
+source's events are processed in order", which is the per-entity order §7 said the shared queue
+cannot give.
+
+### What changes in the answer
+
+The experiment the outline proposes is its most consequential claim, and it holds. On the brief's
+numbers and at the brief's thread counts, one ring per producer:
+- meets the p99 that the shared ring misses;
+- leaves no hole for a preempted producer to open;
+- by construction, processes each source's events in order.
+
+What it gives up is everything the shared head did: a source busier than one consumer loses events
+while fifteen consumers sit idle.
+
+Neither design answers the brief as written, because the brief does not say whether its 32 sources
+are balanced, and that is now the deciding question:
+- **Balanced or untrusted sources** want one ring each.
+- **A source that can legitimately outrun one consumer** wants a shared head.
+
+The design that would serve both keeps a ring per producer and has idle consumers steal from busy
+rings. That makes each ring single-producer and multi-consumer again, and puts a CAS back on its
+head. It is not built here.
 
 ---
 
@@ -699,6 +927,14 @@ head without reading the tail.
 
 **Event count** — a sleep primitive made of a generation number and a waiter count, used here so that
 a producer with nobody to wake pays a fence and a load.
+
+**Epoch (wake protocol)** — the reference outline's alternative to the event count: a counter every
+push increments and wakes on, whether or not anyone sleeps. It needs no fence, and costs a shared
+read-modify-write and a wake call per push (§13).
+
+**SPSC** — single-producer, single-consumer: a ring with exactly one writer and one reader, so that
+neither side needs a read-modify-write to claim a position. Kata 1's ring, and §13's one ring per
+producer.
 
 **Store buffering** — the litmus pattern in which two threads each store to one location and then
 load the other's, and both see the old values. The one reordering x86's memory model permits, and

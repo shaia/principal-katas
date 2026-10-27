@@ -8,6 +8,7 @@
 #include "mpmc_queue.hpp"
 #include "mutex_queue.hpp"
 #include "platform.hpp"
+#include "sharded_queue.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -25,6 +26,14 @@ using Backoff   = Queue<Event, kCapacity, Options{.backoff = true}>;
 // The first versions of the two wake economies, kept to be measured beside the fixes.
 using WakeEveryPush    = Queue<Event, kCapacity, Options{.coalesce_wakes = false}>;
 using WakeEveryRelease = Queue<Event, kCapacity, Options{.batch_full_wakes = false}>;
+
+// The reference outline's alternatives, for phase 9. Outline is its queue: a CAS
+// reservation, and an epoch advanced and woken on every push. Spinning is the
+// turnstile with consumers that never sleep. PerProducer is the experiment it
+// proposes: one SPSC ring per producer, 2,048 slots each.
+using Outline     = Queue<Event, kCapacity, Options{.wake = Wake::epoch}>;
+using Spinning    = Queue<Event, kCapacity, Options{.park = false}>;
+using PerProducer = ShardedQueue<Event, kCapacity, kProducers, kConsumers>;
 
 // The rate the capacity arithmetic is checked at. The brief's 5 M/s is beyond what
 // this machine sustains with 48 threads once its clock has dropped, and a queue

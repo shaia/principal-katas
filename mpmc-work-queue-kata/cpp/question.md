@@ -282,7 +282,7 @@ because the reordering it forbids is the one x86 really does.
 | C1 | §3 reservation, publication, and the two pairs |
 | C2 | §4 the slot and its object — raw storage, the nothrow window, and why there is no `emplace` |
 | C3 | §5 the two primitives, measured · §8 retries as producers are added, and the backoff that did not help |
-| C4 | §6 sleeping, and the wake that costs more than the budget — the event count, and why it has its own timed wait |
+| C4 | §6 sleeping, and the wake that costs more than the budget — the event count, and why it has its own timed wait · §13 the outline's epoch, which needs no fence because it always writes |
 | C5 | §12 the bug × tool table, filled in by running it — including the cell the prediction got right |
 
 Then read what the same questions look like in the other two:

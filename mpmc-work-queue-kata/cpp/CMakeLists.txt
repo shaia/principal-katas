@@ -44,6 +44,7 @@ add_executable(solution
   bench/preemption.cpp
   bench/contention.cpp
   bench/shutdown.cpp
+  bench/outline.cpp
   bench/bugs.cpp)
 target_link_libraries(solution PRIVATE turnstile)
 target_include_directories(solution PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)

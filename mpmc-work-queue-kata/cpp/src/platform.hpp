@@ -150,6 +150,28 @@ inline void wake_all(std::atomic<std::uint32_t>& word) noexcept {
 #endif
 }
 
+// CPU time this process has used, every thread, user and kernel, in seconds.
+// On Windows from the cycle-time accounting, which reads the TSC at each context
+// switch, so `ns_per_tsc_tick` converts it. The user and kernel times
+// GetProcessTimes reports are charged a timer tick at a time, too coarse for the
+// few milliseconds a second an idle queue uses; phase 9 checks the conversion
+// against a thread kept busy for a known time.
+inline double process_cpu_seconds(double ns_per_tsc_tick) noexcept {
+#if defined(_WIN32)
+    ULONG64 cycles = 0;
+    if (!::QueryProcessCycleTime(::GetCurrentProcess(), &cycles)) return 0;
+    return static_cast<double>(cycles) * ns_per_tsc_tick * 1e-9;
+#elif defined(__linux__)
+    (void)ns_per_tsc_tick;
+    timespec ts{};
+    ::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+#else
+    (void)ns_per_tsc_tick;
+    return 0;
+#endif
+}
+
 // ---------------------------------------------------------------- placement
 
 inline int logical_cpus() noexcept { return static_cast<int>(std::thread::hardware_concurrency()); }

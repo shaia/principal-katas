@@ -20,6 +20,9 @@
 //      once with tickets and CAS mixed, where a ticket taken after the close must
 //      be paid with a tombstone. A reservation that slipped through unpaid would
 //      either be lost or leave the consumers waiting for it forever.
+//
+// The reference outline's alternatives take 1 and 3 as well: its epoch wake, and
+// one SPSC ring per producer, whose close races each producer's publication.
 
 #include "arms.hpp"
 #include "config.hpp"
@@ -90,6 +93,8 @@ void phase_shutdown(const Context& ctx) {
     close_under_load(ctx, "turnstile (CAS)", std::make_unique<Turnstile>());
     close_under_load(ctx, "turnstile (ticket)", std::make_unique<Ticket>());
     close_under_load(ctx, "mutex + 2 condvars", std::make_unique<Locked>());
+    close_under_load(ctx, "outline (CAS + epoch)", std::make_unique<Outline>());
+    close_under_load(ctx, "per-producer SPSC", std::make_unique<PerProducer>());
 
     // 2.
     {
@@ -121,6 +126,8 @@ void phase_shutdown(const Context& ctx) {
     close_versus_reserve<Queue<Event, 64>>(ctx, "CAS, reject on full", PushMode::reject);
     close_versus_reserve<Queue<Event, 64, Options{.reserve = Reserve::ticket}>>(ctx, "ticket + CAS mixed",
                                                                                PushMode::mixed);
+    close_versus_reserve<ShardedQueue<Event, 64, 8, 8>>(ctx, "per-producer, reject", PushMode::reject);
+    close_versus_reserve<ShardedQueue<Event, 64, 8, 8>>(ctx, "per-producer, block", PushMode::block);
 }
 
 }  // namespace turnstile::bench
