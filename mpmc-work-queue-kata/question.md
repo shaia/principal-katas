@@ -558,8 +558,9 @@ case for a design in which nobody can observe the difference.
   slot reserver — compare the blast radius, not the mechanism
 - what batching does to the mutex's arithmetic: how many events per acquisition reach 5 M/s, and
   what a batch API means for a producer that only ever has one event in hand
-- the sharded alternative — one queue per consumer: what it fixes, and the requirement it breaks.
-  Then say what the single shared head was actually providing that the shards do not
+- the sharded alternatives — one queue per producer, or one per consumer: what each fixes, and the
+  requirement it breaks. Then say what the single shared head was actually providing that the shards
+  do not, and what happens under each to every other source when one source floods
 - how many protocols a maintainer must hold in their head for each design, and which of them a
   reviewer would notice being broken
 - what would have to be true of your system for the per-slot design to be the wrong engineering call
@@ -622,6 +623,11 @@ and in Python, reserving and publishing are a single operation — until a proce
 apart again, further than in either of the others.
 
 Do steps 0–10 first; each track assumes you have an answer to defend.
+
+Answers, once you have yours: [cpp/solution.md](cpp/solution.md). The Go and Python answers are not
+written yet. The answer outline that came with the question is in
+[reference-outline.md](reference-outline.md), and
+[cpp §13](cpp/solution.md#13-the-reference-outline-checked) checks it against measurements.
 
 | Track | What it adds |
 |---|---|
@@ -701,13 +707,21 @@ when the head reaches the final tail and every slot below it has been paid — a
 slots, never "empty".
 
 **Contention.** At least two contended read-modify-writes per event — the tail CAS and the head CAS —
-plus the slot's own line moving between producer and consumer. At 5 M/s that fits on one socket with
-headroom, and it does not leave much across sockets. The 2 µs p99 is at risk from 32-way arrival
-bursts on one line, and from consumers that cannot keep up — which no queue design fixes.
+plus the slot's own line moving between producer and consumer. The line itself has headroom: one
+contended `fetch_add` sustains far more than 5 M/s even at 32 threads. A CAS loop is what spends it,
+multiplying the transfers by its retries, so the reject policy's reservation is the one that runs out
+first — and a blocking push that takes a ticket instead, never retrying, is the one that keeps the
+p99. The 2 µs is also at risk from 32-way arrival bursts on one line, and from consumers that cannot
+keep up, which no queue design fixes. (This paragraph originally said 5 M/s "fits on one socket with
+headroom"; the C++ answer measured the CAS design at about 5 M/s and no more, on one socket.)
 
 **And the counter-argument that has to be made.** A mutex makes the distinction *unobservable*
 rather than representable, and answers steps 2, 5 and 8 by construction. With batching it can reach
 the throughput. What it cannot do is keep a preempted thread from blocking everyone. The shared head
-that both designs keep is not overhead: with sixteen consumers, it is the load balancer.
+that both designs keep is not overhead: with sixteen consumers, it is the load balancer. It is also a
+shared fate. The C++ answer later ran the alternative the question's own outline proposes, one ring
+per producer: it met the p99 the shared head missed, refused most of a source busier than one
+consumer, and left a flood from one source unable to touch the other 31
+([cpp §13](cpp/solution.md#13-the-reference-outline-checked)).
 
 </details>
