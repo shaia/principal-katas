@@ -39,7 +39,9 @@ func RunBug(name string) int {
 	defer watchdogExit("the stress", 30*time.Second, 1)()
 
 	s := Spec{Producers: 8, Consumers: 8, Events: 25_000 / scale}
-	r := Run(turnstile.NewRing[ev, struct{}](64, turnstile.Options{Bug: b}), s)
+	// PushContext, a compare-and-swap, because the full check it skips is the
+	// CAS reservation's.
+	r := Run(packedVariant(64, false, turnstile.Variant{Bug: b}), s)
 	detected := !r.ExactlyOnce || r.Torn > 0 || r.Disorder > 0
 	fmt.Printf("  %d x %d on a 64-slot ring, %d events each: accepted %d, consumed %d, torn %d, out of order %d\n",
 		s.Producers, s.Consumers, s.Events, r.Accepted, r.Consumed, r.Torn, r.Disorder)

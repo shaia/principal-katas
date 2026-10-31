@@ -1,6 +1,8 @@
 package turnstile
 
 import (
+	"context"
+	"errors"
 	"os"
 	"runtime"
 	"sync"
@@ -8,29 +10,31 @@ import (
 	"testing"
 	"time"
 	"weak"
+
+	"turnstile/internal/platform"
 )
 
-type queue interface {
-	TryPush(e Event, st *OpStats) Push
-	Push(e Event, until time.Time, st *OpStats) Push
-	TryPop(e *Event, st *OpStats) Pop
-	Pop(e *Event, until time.Time, st *OpStats) Pop
-	Close()
-	ProducersDone()
-	Occupancy() uint64
+// Benchmarks here run many goroutines at once, and Windows throttles a process
+// that is not in the foreground unless it says otherwise.
+func TestMain(m *testing.M) {
+	platform.SetPowerThrottling(false)
+	os.Exit(m.Run())
 }
 
+// mode is how stress's producers push.
 type mode int
 
 const (
-	block mode = iota
-	reject
+	try    mode = iota // TryPush, yielding on ErrFull
+	ticket             // Push
+	cas                // PushContext
 )
 
 // stress pushes `events` from each producer, or pushes until refused as closed
 // when closeAfter is set, and checks what the consumers took: every accepted
-// event exactly once, intact, and in order per producer from each consumer's view.
-func stress(t *testing.T, q queue, producers, consumers, events int, m mode, closeAfter time.Duration) {
+// event exactly once, intact, and in order per producer from each consumer's
+// view.
+func stress(t *testing.T, q *Ring[Event], producers, consumers, events int, m mode, closeAfter time.Duration) {
 	t.Helper()
 	accepted := make([]Tally, producers)
 	consumed := make([]Tally, consumers)
@@ -38,59 +42,60 @@ func stress(t *testing.T, q queue, producers, consumers, events int, m mode, clo
 	var torn, disorder atomic.Uint64
 	var pw, cw sync.WaitGroup
 	pw.Add(producers)
-	for p := 0; p < producers; p++ {
-		go func(p int) {
+	for i := range producers {
+		go func() {
 			defer pw.Done()
-			var st OpStats
-			for i := 0; closeAfter > 0 || i < events; i++ {
-				e := MakeEvent(uint32(p), uint32(i), 0)
-				var r Push
-				if m == reject {
-					for r = q.TryPush(e, &st); r == PushFull; r = q.TryPush(e, &st) {
+			p := q.Producer()
+			for seq := 0; closeAfter > 0 || seq < events; seq++ {
+				e := MakeEvent(uint32(i), uint32(seq), 0)
+				var err error
+				switch m {
+				case try:
+					for err = p.TryPush(e); err == ErrFull; err = p.TryPush(e) {
 						runtime.Gosched()
 					}
-				} else {
-					r = q.Push(e, time.Now().Add(time.Minute), &st)
+				case ticket:
+					err = p.Push(e)
+				case cas:
+					err = p.PushContext(context.Background(), e)
 				}
-				if r == PushClosed {
-					closedSeen[p] = true
+				if errors.Is(err, ErrClosed) {
+					closedSeen[i] = true
 					return
 				}
-				if r != PushOK {
-					t.Errorf("producer %d: push %d ended %d", p, i, r)
+				if err != nil {
+					t.Errorf("producer %d: push %d: %v", i, seq, err)
 					return
 				}
-				accepted[p].Add(uint32(p), uint32(i))
+				accepted[i].Add(uint32(i), uint32(seq))
 			}
-		}(p)
+		}()
 	}
 	cw.Add(consumers)
-	for c := 0; c < consumers; c++ {
-		go func(c int) {
+	for i := range consumers {
+		go func() {
 			defer cw.Done()
-			var st OpStats
+			c := q.Consumer()
 			last := make([]int64, producers)
-			for i := range last {
-				last[i] = -1
+			for j := range last {
+				last[j] = -1
 			}
-			var e Event
 			for {
-				switch q.Pop(&e, time.Now().Add(time.Minute), &st) {
-				case PopDrained:
+				e, err := c.Pop()
+				if errors.Is(err, ErrClosed) {
 					return
-				case PopOK:
-					if !Intact(&e) || int(e.Producer) >= producers {
-						torn.Add(1)
-						continue
-					}
-					if int64(e.Seq) <= last[e.Producer] {
-						disorder.Add(1)
-					}
-					last[e.Producer] = int64(e.Seq)
-					consumed[c].Add(e.Producer, e.Seq)
 				}
+				if !Intact(&e) || int(e.Producer) >= producers {
+					torn.Add(1)
+					continue
+				}
+				if int64(e.Seq) <= last[e.Producer] {
+					disorder.Add(1)
+				}
+				last[e.Producer] = int64(e.Seq)
+				consumed[i].Add(e.Producer, e.Seq)
 			}
-		}(c)
+		}()
 	}
 	if closeAfter > 0 {
 		time.Sleep(closeAfter)
@@ -100,7 +105,6 @@ func stress(t *testing.T, q queue, producers, consumers, events int, m mode, clo
 		pw.Wait()
 		q.Close()
 	}
-	q.ProducersDone()
 	cw.Wait()
 
 	var a, c Tally
@@ -120,9 +124,9 @@ func stress(t *testing.T, q queue, producers, consumers, events int, m mode, clo
 		t.Errorf("%d events out of order for their producer", n)
 	}
 	if closeAfter > 0 {
-		for p, seen := range closedSeen {
+		for i, seen := range closedSeen {
 			if !seen {
-				t.Errorf("producer %d was never refused as closed", p)
+				t.Errorf("producer %d was never refused as closed", i)
 			}
 		}
 	}
@@ -137,87 +141,72 @@ func events(n int) int {
 	return n
 }
 
+var modes = []struct {
+	name string
+	m    mode
+}{{"TryPush", try}, {"Push", ticket}, {"PushContext", cas}}
+
 // Two and four slots: every few events a lap wraps, with slots still reserved.
 func TestLapWrap(t *testing.T) {
 	for _, n := range []int{2, 4} {
-		for _, c := range []struct {
-			name string
-			opt  Options
-			m    mode
-		}{
-			{"cas-block", Options{}, block},
-			{"ticket-block", Options{Reserve: ReserveTicket}, block},
-			{"reject", Options{}, reject},
-		} {
-			t.Run(c.name, func(t *testing.T) {
-				stress(t, NewRing[Event, struct{}](n, c.opt), 4, 4, events(20000), c.m, 0)
+		for _, m := range modes {
+			t.Run(m.name, func(t *testing.T) {
+				stress(t, New[Event](n), 4, 4, events(20000), m.m, 0)
 			})
 		}
 	}
 }
 
 func TestFullFigures(t *testing.T) {
-	stress(t, NewRing[Event, LinePad](1<<10, Options{Reserve: ReserveTicket}), 8, 8, events(50000), block, 0)
-	stress(t, NewChan[Event](1<<10, SendFast), 8, 8, events(50000), block, 0)
+	stress(t, New[Event](1<<10), 8, 8, events(50000), ticket, 0)
 }
 
 // With no consumer, exactly capacity events go in and none is overwritten.
 func TestNeverOverwrites(t *testing.T) {
-	for name, q := range map[string]queue{
-		"ring": NewRing[Event, LinePad](64, Options{}),
-		"chan": NewChan[Event](64, SendFast),
-	} {
-		var st OpStats
-		n := 0
-		for q.TryPush(MakeEvent(0, uint32(n), 0), &st) == PushOK {
-			n++
-		}
-		if n != 64 {
-			t.Errorf("%s: accepted %d into 64 slots", name, n)
-		}
+	q := New[Event](64)
+	p := q.Producer()
+	n := 0
+	for p.TryPush(MakeEvent(0, uint32(n), 0)) == nil {
+		n++
+	}
+	if n != 64 {
+		t.Errorf("accepted %d into 64 slots", n)
+	}
+	if err := p.TryPush(Event{}); !errors.Is(err, ErrFull) {
+		t.Errorf("a push into a full ring: %v, want ErrFull", err)
 	}
 }
 
 // A close racing pushes strands nothing: every producer is refused, and every
 // event accepted before the refusal is consumed.
 func TestCloseVersusReserve(t *testing.T) {
-	for _, c := range []struct {
-		name string
-		q    func() queue
-		m    mode
-	}{
-		{"ring-cas-block", func() queue { return NewRing[Event, struct{}](64, Options{}) }, block},
-		{"ring-ticket-block", func() queue { return NewRing[Event, struct{}](64, Options{Reserve: ReserveTicket}) }, block},
-		{"ring-reject", func() queue { return NewRing[Event, struct{}](64, Options{}) }, reject},
-		{"chan-fast", func() queue { return NewChan[Event](64, SendFast) }, block},
-		{"chan-select", func() queue { return NewChan[Event](64, SendSelect) }, block},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			for round := 0; round < 20; round++ {
-				stress(t, c.q(), 8, 4, 0, c.m, time.Duration(round%4+1)*time.Millisecond)
+	for _, m := range modes {
+		t.Run(m.name, func(t *testing.T) {
+			for round := range 20 {
+				stress(t, New[Event](64), 8, 4, 0, m.m, time.Duration(round%4+1)*time.Millisecond)
 			}
 		})
 	}
 }
 
-// Three producers pass the ticket pre-check, then the queue closes with nothing
+// Three producers pass the ticket pre-check, then the ring closes with nothing
 // in it and its consumers leave, then all three take their tickets — on a
 // two-slot ring, so the third ticket maps to the first one's slot. A ticket
 // taken after the close must not wait for a slot no consumer will free again.
 func TestTicketAfterCloseDoesNotWaitForASlot(t *testing.T) {
-	r := NewRing[Event, struct{}](2, Options{Reserve: ReserveTicket})
-	r.Close()
-	var st OpStats
-	if got := r.Pop(new(Event), time.Now().Add(time.Second), &st); got != PopDrained {
-		t.Fatalf("an empty closed ring: Pop returned %d, want drained", got)
+	q := New[Event](2)
+	q.Close()
+	if _, err := q.Consumer().Pop(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("an empty closed ring: Pop returned %v, want ErrClosed", err)
 	}
-	for i := 0; i < 3; i++ {
-		done := make(chan Push)
-		go func() { done <- r.pushTicket(MakeEvent(0, uint32(i), 0), &st) }()
+	p := q.Producer()
+	for i := range 3 {
+		done := make(chan error)
+		go func() { done <- p.pushTicket(MakeEvent(0, uint32(i), 0)) }()
 		select {
-		case got := <-done:
-			if got != PushClosed {
-				t.Fatalf("ticket %d after the close: %d, want closed", i, got)
+		case err := <-done:
+			if !errors.Is(err, ErrClosed) {
+				t.Fatalf("ticket %d after the close: %v, want ErrClosed", i, err)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("ticket %d after the close is still waiting for its slot", i)
@@ -227,11 +216,11 @@ func TestTicketAfterCloseDoesNotWaitForASlot(t *testing.T) {
 
 // More producers than slots, all blocking with tickets, closed early and often.
 func TestTicketsAfterCloseNeverStrand(t *testing.T) {
-	for round := 0; round < 200; round++ {
+	for round := range 200 {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			stress(t, NewRing[Event, struct{}](2, Options{Reserve: ReserveTicket}), 64, 2, 0, block,
+			stress(t, New[Event](2), 64, 2, 0, ticket,
 				time.Duration(round%5)*100*time.Microsecond+50*time.Microsecond)
 		}()
 		select {
@@ -242,30 +231,64 @@ func TestTicketsAfterCloseNeverStrand(t *testing.T) {
 	}
 }
 
+func TestPushContextHonoursItsDeadline(t *testing.T) {
+	q := New[Event](2)
+	p := q.Producer()
+	p.TryPush(Event{})
+	p.TryPush(Event{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := p.PushContext(ctx, Event{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a push into a full ring with a deadline: %v, want DeadlineExceeded", err)
+	}
+}
+
+func TestPopContextHonoursItsDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := New[Event](2).Consumer().PopContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a pop from an empty ring with a deadline: %v, want DeadlineExceeded", err)
+	}
+}
+
+// The limit is checked when the handle is made, not when it first sleeps.
+func TestSixtyFifthConsumerIsRefused(t *testing.T) {
+	q := New[Event](2)
+	for range 64 {
+		q.Consumer()
+	}
+	defer func() {
+		if recover() == nil {
+			t.Error("a 65th consumer was accepted")
+		}
+	}()
+	q.Consumer()
+}
+
 // A fill that panics inside the window still pays its slot, so the consumers
 // behind it are not stopped.
 func TestPanicInWindowPaysTombstone(t *testing.T) {
-	r := NewRing[Event, LinePad](8, Options{})
-	var st OpStats
+	q := New[Event](8)
+	p, c := q.Producer(), q.Consumer()
 	func() {
 		defer func() {
 			if recover() == nil {
 				t.Fatal("the fill's panic did not reach the caller")
 			}
 		}()
-		r.TryPushFunc(func(*Event) { panic("constructor failed") }, &st)
+		p.TryPushFunc(func(*Event) { panic("constructor failed") })
 	}()
-	for i := 0; i < 3; i++ {
-		r.TryPush(MakeEvent(0, uint32(i), 0), &st)
+	for i := range 3 {
+		p.TryPush(MakeEvent(0, uint32(i), 0))
 	}
-	for i := 0; i < 3; i++ {
-		var e Event
-		if got := r.TryPop(&e, &st); got != PopOK || e.Seq != uint32(i) {
-			t.Fatalf("pop %d: %d, seq %d — the tombstone was not skipped", i, got, e.Seq)
+	for i := range 3 {
+		e, ok := c.TryPop()
+		if !ok || e.Seq != uint32(i) {
+			t.Fatalf("pop %d: %v, seq %d — the tombstone was not skipped", i, ok, e.Seq)
 		}
 	}
-	if r.Occupancy() != 0 {
-		t.Errorf("occupancy %d after draining", r.Occupancy())
+	if q.Len() != 0 {
+		t.Errorf("Len %d after draining", q.Len())
 	}
 }
 
@@ -273,7 +296,7 @@ type referent [1 << 10]byte
 
 // A consumed slot must not keep its referent alive. The channel clears the slot
 // it received from (typedmemclr in runtime.chanrecv); the ring has to do it by
-// hand, and with Retain it does not.
+// hand, and with Variant.Retain it does not.
 func TestConsumedSlotReleasesReferent(t *testing.T) {
 	alive := func(push func(*referent), pop func() *referent) int {
 		ws := make([]weak.Pointer[referent], 32)
@@ -296,18 +319,21 @@ func TestConsumedSlotReleasesReferent(t *testing.T) {
 		}
 		return n
 	}
-	var st OpStats
 	for _, retain := range []bool{false, true} {
-		r := NewRing[*referent, struct{}](64, Options{Retain: retain})
-		n := alive(func(p *referent) { r.TryPush(p, &st) },
-			func() *referent { var p *referent; r.TryPop(&p, &st); return p })
-		if want := map[bool]int{false: 0, true: 32}[retain]; n != want {
+		q := NewVariant[*referent](64, Variant{Retain: retain})
+		p, c := q.Producer(), q.Consumer()
+		n := alive(func(r *referent) { p.TryPush(r) }, func() *referent { r, _ := c.TryPop(); return r })
+		want := 0
+		if retain {
+			want = 32
+		}
+		if n != want {
 			t.Errorf("ring, retain=%v: %d of 32 referents alive after consumption, want %d", retain, n, want)
 		}
-		runtime.KeepAlive(r)
+		runtime.KeepAlive(q)
 	}
 	ch := make(chan *referent, 64)
-	if n := alive(func(p *referent) { ch <- p }, func() *referent { return <-ch }); n != 0 {
+	if n := alive(func(r *referent) { ch <- r }, func() *referent { return <-ch }); n != 0 {
 		t.Errorf("channel: %d of 32 referents alive after consumption", n)
 	}
 	runtime.KeepAlive(ch)
@@ -322,5 +348,5 @@ func TestRaceDetectorSeesPublishFirst(t *testing.T) {
 	if os.Getenv("TURNSTILE_SHOW_RACE") == "" {
 		t.Skip("set TURNSTILE_SHOW_RACE=1, under -race, to watch the detector report the race")
 	}
-	stress(t, NewRing[Event, struct{}](4, Options{Bug: BugPublishFirst}), 2, 2, 2000, block, 0)
+	stress(t, NewVariant[Event](4, Variant{Bug: BugPublishFirst}), 2, 2, 2000, ticket, 0)
 }

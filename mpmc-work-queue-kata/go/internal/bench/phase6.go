@@ -2,8 +2,9 @@ package bench
 
 // Phase 6 — measure the tail you promised (step G6), and decide.
 //
-//  1. The brief's rate with every arm side by side, interleaved: the channel
-//     and the ring with each reservation. Then the C++ track's other two rows
+//  1. The brief's rate with every arm side by side, interleaved: the channel,
+//     the ring with each blocking push, and the ring with consumers that park
+//     without spinning first. Then the C++ track's other two rows
 //     for the channel and the ticket: 16 × 8 at 5 M/s, and 32 × 16 at 1 M/s.
 //  2. The decision, written before the run: the ring is kept only if its p99
 //     beats the channel's in every repetition, not only at the median.
@@ -35,7 +36,7 @@ func summarize(r *Result) summary {
 }
 
 func init() {
-	for name, q := range map[string]func() Queue{"tail-ticket": ringTicket, "tail-chan": chanWith(turnstile.SendFast)} {
+	for name, q := range map[string]func() Queue{"tail-ticket": ringTicket, "tail-chan": chanWith(sendFast)} {
 		children[name] = func() any {
 			r := Run(q(), briefSpec())
 			CheckRun(&r, name)
@@ -62,9 +63,10 @@ func Phase6() {
 
 	// 1. The brief's rate.
 	arms := []arm{
-		{name: "channel, fast path", make: chanWith(turnstile.SendFast)},
-		{name: "ring, ticket", make: ringTicket},
-		{name: "ring, CAS", make: ringCAS},
+		{name: "channel, fast path", make: chanWith(sendFast)},
+		{name: "ring, Push (ticket)", make: ringTicket},
+		{name: "ring, PushContext (CAS)", make: ringCAS},
+		{name: "ring, Push, park at once", make: ringWith(true, turnstile.Variant{NoSpin: true})},
 	}
 	res := interleave(arms, 3, briefSpec(), "the tail at 32 x 16")
 	fmt.Printf("  32 x 16 at 5 M/s, block on full, consumers spend %s per event; median of 3:\n", Ns(WorkNs))
@@ -95,7 +97,7 @@ func Phase6() {
 	}{{"16 x 8 at 5 M/s", 16, 8, 5e6}, {"32 x 16 at 1 M/s", 32, 16, 1e6}} {
 		spec := briefSpec()
 		spec.Producers, spec.Consumers, spec.Rate = row.p, row.c, row.rate
-		pair := []arm{{name: row.what + ", channel", make: chanWith(turnstile.SendFast)},
+		pair := []arm{{name: row.what + ", channel", make: chanWith(sendFast)},
 			{name: row.what + ", ticket", make: ringTicket}}
 		r := interleave(pair, 3, spec, "the tail at "+row.what)
 		for i, a := range pair {
@@ -112,19 +114,26 @@ func Phase6() {
 		bestChan = min(bestChan, Q(&r.Push, 0.99))
 	}
 	ticket99 := Median(res[1], func(r Result) float64 { return Q(&r.Push, 0.99) })
+	decision := "the ring stays"
+	if worstRing >= bestChan {
+		decision = "delete the ring"
+	}
+	verdict := "meets"
+	if ticket99 > BudgetNs {
+		verdict = "misses"
+	}
 	fmt.Printf("\n  the decision: the ticket ring's worst p99 of three, %s, against the channel's best, %s — %s\n",
-		Ns(worstRing), Ns(bestChan), map[bool]string{true: "the ring stays", false: "delete the ring"}[worstRing < bestChan])
-	fmt.Printf("  the brief: the ticket ring's median p99 at 32 x 16 is %s, which %s 2 us\n", Ns(ticket99),
-		map[bool]string{true: "meets", false: "misses"}[ticket99 <= BudgetNs])
+		Ns(worstRing), Ns(bestChan), decision)
+	fmt.Printf("  the brief: the ticket ring's median p99 at 32 x 16 is %s, which %s 2 us\n", Ns(ticket99), verdict)
 
 	// 3. The ceiling.
 	sat := Spec{Producers: Producers, Consumers: Consumers, Events: 250_000}
 	satArms := []arm{
-		{name: "channel, bare send", make: chanWith(turnstile.SendPlain)},
-		{name: "channel, fast path", make: chanWith(turnstile.SendFast)},
-		{name: "ring, ticket, slot per line", make: ringTicket},
-		{name: "ring, ticket, slots packed", make: ringPacked},
-		{name: "ring, CAS", make: ringCAS},
+		{name: "channel, bare send", make: chanWith(sendPlain)},
+		{name: "channel, fast path", make: chanWith(sendFast)},
+		{name: "ring, Push, slot per line", make: ringTicket},
+		{name: "ring, Push, slots packed", make: ringPacked},
+		{name: "ring, PushContext", make: ringCAS},
 	}
 	sr := interleave(satArms, 3, sat, "saturated")
 	fmt.Printf("\n  saturated, 32 x 16, %d events per producer, nothing done per event; median of 3:\n", sat.Events)
@@ -139,7 +148,8 @@ func Phase6() {
 	// 4. Asynchronous preemption.
 	fmt.Printf("\n  asynchronous preemption, 32 x 16 at 5 M/s, each run a child process; median of 3:\n")
 	fmt.Printf("    %-28s %9s %9s %9s %9s %10s\n", "", "achieved", "push p50", "p99", "p99.9", "behind p99")
-	for _, name := range []string{"tail-ticket", "tail-chan"} {
+	for _, child := range []struct{ name, label string }{{"tail-ticket", "ring, Push"}, {"tail-chan", "channel"}} {
+		name := child.name
 		got := map[bool][]summary{}
 		for rep := 0; rep < 3; rep++ {
 			for _, on := range []bool{true, false} {
@@ -157,8 +167,10 @@ func Phase6() {
 			if len(v) == 0 {
 				continue
 			}
-			label := map[string]string{"tail-ticket": "ring, ticket", "tail-chan": "channel"}[name] +
-				map[bool]string{true: ", async on", false: ", async off"}[on]
+			label := child.label + ", async off"
+			if on {
+				label = child.label + ", async on"
+			}
 			fmt.Printf("    %-28s %9s %9s %9s %9s %10s\n", label,
 				Rate(Median(v, func(s summary) float64 { return s.Rate })),
 				Ns(Median(v, func(s summary) float64 { return s.P50 })),

@@ -12,9 +12,12 @@ package bench
 //     asynchronous preemption on and off.
 //  2. GOMAXPROCS against the brief's 48 goroutines: below, at and above the
 //     machine's 32 logical CPUs.
-//  3. A panic inside the window, and what the defer that pays for it costs.
+//
+// A panic inside the window is a test (TestPanicInWindowPaysTombstone), and
+// what the defer that pays for it costs is a benchmark (BenchmarkPushFuncPop).
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"slices"
@@ -29,13 +32,14 @@ import (
 const holeProcs, holeSpinners, holeTrials = 4, 12, 5
 
 var holeArms = []struct {
-	name string
-	opt  *turnstile.Options // nil: a tight spin on a flag, with no calls in the loop
+	name  string
+	tight bool // a spin on a flag, with no calls in the loop, instead of a ring
+	v     turnstile.Variant
 }{
-	{"a tight spin, no calls in the loop", nil},
-	{"Ring.Pop, spin only", &turnstile.Options{Spin: true}},
-	{"Ring.Pop, spin with Gosched", &turnstile.Options{Spin: true, Yield: true}},
-	{"Ring.Pop, spin, then park", &turnstile.Options{}},
+	{"a tight spin, no calls in the loop", true, turnstile.Variant{}},
+	{"Pop, spin only", false, turnstile.Variant{Spin: true}},
+	{"Pop, spin with Gosched", false, turnstile.Variant{Spin: true, Yield: true}},
+	{"Pop, spin, then park (the ring's)", false, turnstile.Variant{}},
 }
 
 // holeResult is, per arm, every trial's hole in nanoseconds.
@@ -50,7 +54,7 @@ func init() {
 		out := holeResult{Holes: make([][]float64, len(holeArms))}
 		for t := 0; t < holeTrials; t++ {
 			for i, a := range holeArms {
-				out.Holes[i] = append(out.Holes[i], hole(a.opt))
+				out.Holes[i] = append(out.Holes[i], hole(a.tight, a.v))
 			}
 		}
 		out.Failures = Failures()
@@ -65,7 +69,7 @@ func init() {
 // goroutine on the creating P's own run queue, so the ones that have not yet
 // found a P are queued where the producer is running; when it yields, its P
 // takes one of them, and the producer waits on the global queue behind every P.
-func hole(opt *turnstile.Options) float64 {
+func hole(tight bool, v turnstile.Variant) float64 {
 	giveUp := time.Second
 	var started atomic.Int32
 	var reservedAt, publishedAt atomic.Uint64
@@ -84,7 +88,7 @@ func hole(opt *turnstile.Options) float64 {
 	}
 
 	wg.Add(1)
-	if opt == nil {
+	if tight {
 		var flag atomic.Bool
 		end := tsc.Ticks() + Clk.Ticks(float64(giveUp.Nanoseconds()))
 		go func() {
@@ -104,24 +108,21 @@ func hole(opt *turnstile.Options) float64 {
 		return Clk.Ns(publishedAt.Load() - reservedAt.Load())
 	}
 
-	o := *opt
-	o.Hooks = &turnstile.Hooks{Reserved: func(uint64) {
+	v.Hooks.Reserved = func(uint64) {
 		reservedAt.Store(tsc.Ticks())
 		runtime.Gosched()
-	}}
-	r := turnstile.NewRing[ev, turnstile.LinePad](64, o)
-	until := time.Now().Add(giveUp)
+	}
+	q := turnstile.NewVariant[ev](64, v)
+	ctx, cancel := context.WithTimeout(context.Background(), giveUp)
+	defer cancel()
 	go func() {
 		defer wg.Done()
 		spawn(func() {
-			var st turnstile.OpStats
-			var e ev
-			if r.Pop(&e, until, &st) == turnstile.PopOK {
-				r.Close() // the other consumers drain and leave
+			if _, err := q.Consumer().PopContext(ctx); err == nil {
+				q.Close() // the other consumers drain and leave
 			}
 		})
-		var st turnstile.OpStats
-		r.TryPush(turnstile.MakeEvent(0, 0, 0), &st)
+		q.Producer().TryPush(turnstile.MakeEvent(0, 0, 0))
 		publishedAt.Store(tsc.Ticks())
 	}()
 	wg.Wait()
@@ -178,27 +179,6 @@ func Phase4() {
 		fmt.Printf("    GOMAXPROCS %d: consumers parked with a slot reserved and unpublished %.0f times per run\n", n,
 			Median(res[i], func(r Result) float64 { return float64(r.ConsumerOps.Holes) }))
 	}
-
-	// 3. The panic.
-	r := turnstile.NewRing[ev, turnstile.LinePad](8, turnstile.Options{})
-	var st turnstile.OpStats
-	panicked := func() (p bool) {
-		defer func() { p = recover() != nil }()
-		r.TryPushFunc(func(*ev) { panic("a constructor that throws") }, &st)
-		return
-	}()
-	r.TryPush(turnstile.MakeEvent(0, 1, 0), &st)
-	var e ev
-	got1 := r.TryPop(&e, &st)
-	Check(panicked && got1 == turnstile.PopOK && e.Seq == 1,
-		"a panic inside the window pays its slot with a tombstone, and the queue carries on")
-	big := turnstile.NewRing[ev, turnstile.LinePad](1024, turnstile.Options{})
-	ev0 := turnstile.MakeEvent(0, 0, 0)
-	plain := perOp(func() { big.TryPush(ev0, &st); big.TryPop(&e, &st) })
-	deferred := perOp(func() { big.TryPushFunc(func(p *ev) { *p = ev0 }, &st); big.TryPop(&e, &st) })
-	fmt.Printf("\n  a panic in the window: paid with a tombstone, the next event delivered: %v\n",
-		panicked && got1 == turnstile.PopOK)
-	fmt.Printf("  push and pop, one goroutine: TryPush %s, TryPushFunc with its defer %s\n", Ns(plain), Ns(deferred))
 }
 
 func medianOf(v []float64) float64 { return Median(v, func(x float64) float64 { return x }) }
