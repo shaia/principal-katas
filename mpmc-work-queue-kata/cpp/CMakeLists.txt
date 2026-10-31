@@ -72,8 +72,10 @@ if(TURNSTILE_ASAN)
   target_compile_options(solution PRIVATE -fsanitize=address -g)
   target_link_options(solution PRIVATE -fsanitize=address)
   set_target_properties(solution PROPERTIES OUTPUT_NAME solution_asan)
-  # ASan on Windows does not support the debug CRT; see the mpsc kata's
-  # CMakeLists for the failure this avoids.
+  # ASan cannot be mixed with the debug CRT: such a binary aborts during CRT
+  # teardown with a bad-free whose stack has no frames from this project, which
+  # looks like a lifetime bug and is not. CMake defaults single-config generators
+  # to Debug here, so pin the release runtime for this target.
   set_property(TARGET solution PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 endif()
 if(TURNSTILE_TSAN)

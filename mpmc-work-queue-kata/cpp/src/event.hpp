@@ -1,7 +1,7 @@
 #pragma once
 //
-// The event that crosses the queue: 32 bytes, as in Kata 1, carrying enough to
-// check every delivery the moment it arrives.
+// The event that crosses the queue: 32 bytes, carrying enough to check every
+// delivery the moment it arrives.
 
 #include <cstdint>
 #include <type_traits>

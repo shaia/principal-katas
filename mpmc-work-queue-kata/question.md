@@ -120,8 +120,8 @@ in different states at the same moment.
 
 With one producer it cannot: the producer finishes slots in the order it starts them, so every slot
 between the counters is in the same state and a single index can describe the boundary. That is why
-[Kata 1](../mpsc-event-pipeline-kata/question.md)'s rings needed one published index each. Now count
-the producers in this brief, and ask in what order they finish.
+a ring with one producer needs only one published index. Now count the producers in this brief, and
+ask in what order they finish.
 
 </details>
 
@@ -193,7 +193,8 @@ Split them. Then make the second one carry the payload's visibility with it.
 - a second, "published up to here" counter beside the reservation counter. Make it work with 32
   producers that finish out of order: say what a producer that finished early has to do, and what
   that costs it when the producer ahead of it has been descheduled
-- why Kata 1 needed only one index per ring and this design cannot make do with one — in one clause
+- why a single-producer ring needs only one index and this design cannot make do with one — in one
+  clause
 
 <details>
 <summary>Hint</summary>
@@ -308,17 +309,17 @@ the queue lasts once consumers stop, and say where a dropped event is counted.
 
 ## Step 5 — Sleep without losing a wakeup
 
-Consumers sleep when the queue is empty. Kata 1 had one sleeper. This has sixteen, and every one of
-32 producers has to decide, on every push, whether to wake one of them.
+Consumers sleep when the queue is empty. With one consumer there is one sleeper to wake. This has
+sixteen, and every one of 32 producers has to decide, on every push, whether to wake one of them.
 
 **Be prepared to say:**
 
 - the naive version — *check empty, then sleep* on one side, *push, then notify* on the other — and
   the four-operation interleaving that leaves an event in the queue and every consumer asleep
-- the shape of that race and the ordering it needs (Kata 1's
-  [C++ track, step C2](../mpsc-event-pipeline-kata/cpp/question.md#step-c2--the-one-place-acquirerelease-is-not-enough)),
-  and then where your step-3 protocol puts the producer's half — before or after the slot's
-  publication store — and why the other position is wrong
+- the shape of that race — each side stores to one location and then loads the other's, the pattern
+  called *store buffering* — and the ordering it needs, which acquire/release does not give; then
+  where your step-3 protocol puts the producer's half — before or after the slot's publication store
+  — and why the other position is wrong
 - what a push costs when nobody is asleep, which at 5 M/s is nearly every push. It must not be a
   system call; say what it is instead
 - what a push costs when somebody *is* asleep — the wake, in microseconds, against a 2 µs p99 — and
@@ -338,12 +339,12 @@ waker publishes *before* it checks for sleepers: each side stores to one locatio
 other's, and the ordering between that store and that load is the one acquire/release does not give
 you.
 
-What differs from Kata 1 is who gets woken. There it was the one consumer; here a wake is a choice
-of how many and which, and the producer's half still runs once per event — so it has to be cheap when
-the answer is "nobody is asleep" (one load behind one fence), and the expensive case has to be rare.
-A count of sleepers lets the producer skip the wake almost always. A woken consumer that finds more
-work than it can handle can do the next wake itself, which caps the producer's cost at one wake per
-idle-to-busy transition rather than one per event.
+What differs from a single consumer is who gets woken. With one, it is always that one; here a wake
+is a choice of how many and which, and the producer's half still runs once per event — so it has to
+be cheap when the answer is "nobody is asleep" (one load behind one fence), and the expensive case
+has to be rare. A count of sleepers lets the producer skip the wake almost always. A woken consumer
+that finds more work than it can handle can do the next wake itself, which caps the producer's cost
+at one wake per idle-to-busy transition rather than one per event.
 
 On the last probe: a primitive that sleeps while a value still equals what you last saw can miss a
 change that is reverted before it looks. If your variable can return to a previous value, it can lose
@@ -480,9 +481,11 @@ consumers are asleep, and the queue holds 40,000 events.
 <details>
 <summary>Hint</summary>
 
-"Stop accepting, then drain" — Kata 1 established that the order matters. The new problem is that
-"stop accepting" is not one instant when the acceptance check and the reservation are two operations:
-a producer can pass the check, the queue can close, and the producer can then reserve.
+"Stop accepting, then drain" and "drain, then stop accepting" are not the same sequence, and only the
+first terminates: a drain that runs while the queue still accepts can always find one more event.
+The new problem is that "stop accepting" is not one instant when the acceptance check and the
+reservation are two operations: a producer can pass the check, the queue can close, and the producer
+can then reserve.
 
 That slot is a debt like any other. Either the close and the reservation are a single atomic decision
 on the same word, or every producer that reserves after the close must still pay its slot — with an
@@ -515,8 +518,9 @@ run under load proves very little. Design the verification before you write the 
   producers, consumers, capacity — still exercises the lap wrap from step 3
 - how you *force* step 6 rather than waiting for it: injecting a stall inside the window, and
   measuring what consumers and producers experience
-- how you measure the 2 µs p99 when producers can block — coordinated omission, from Kata 1's step
-  9 — and what a blocked push contributes to the distribution
+- how you measure the 2 µs p99 when producers can block — coordinated omission: why timing only the
+  pushes that ran reports a flattering tail, and what you time instead — and what a blocked push
+  contributes to the distribution
 - how you know a clean run is not vacuous: the deliberate bug you introduce, per tool, to watch it go
   red
 
@@ -537,6 +541,12 @@ capacity two, two producers, two consumers, a few operations each.
 
 And a stall you inject is a stall you can measure. Put a delay inside the window behind a build flag
 and step 6 stops being an argument and becomes a number.
+
+Time the push that was due, not only the push that ran. A producer blocked for 10 ms records one
+10 ms sample and then nothing, though at its share of 5 M/s it owed some 1,560 pushes in that time —
+so a timer around each call turns a stall into one outlier and leaves the p99 clean. Give each
+producer a schedule and measure from when each push was due: how late the event became is the number
+the brief's p99 is about.
 
 </details>
 
@@ -577,9 +587,10 @@ What it costs is that every operation serializes on one line, and a preempted ho
 not just the consumer behind one slot. Price that against the lock's real hold time *with* a batch,
 not against a microbenchmark without one.
 
-For sharding: Kata 1 could dissolve its shared coordination point because it had one consumer. Here
-there are sixteen, and an idle consumer has to find work wherever the work is. Name what does that in
-your design, and ask whether it is overhead or the function the queue exists to perform.
+For sharding: a pipeline with one consumer can dissolve its shared coordination point — one ring per
+producer, scanned by that consumer. Here there are sixteen, and an idle consumer has to find work
+wherever the work is. Name what does that in your design, and ask whether it is overhead or the
+function the queue exists to perform.
 
 </details>
 
@@ -689,8 +700,8 @@ array that records the lap.
 **Wakeups.** An event count — a generation number and a count of sleepers. The consumer registers,
 re-checks the head slot, and then waits for the generation to change. The producer publishes,
 executes a full fence, and wakes only if the sleeper count is non-zero. Without that fence it is
-Kata 1's Dekker race, now on every push. The generation is a counter rather than a flag, because a
-compare-and-block wait can miss a flag that flips back.
+step 5's store-buffering race, now on every push. The generation is a counter rather than a flag,
+because a compare-and-block wait can miss a flag that flips back.
 
 **Preemption, honestly stated.** This design is *blocking* in the progress sense. It has no lock,
 yet a producer descheduled between reserve and publish stops every consumer at that slot: the queue

@@ -11,10 +11,6 @@ lets you find out which of your other beliefs were leaning on it. And across a p
 two come apart again, by more than in any other track — on another thread, with no bound, and the
 standard library documents it.
 
-[Kata 1's Python track](../../mpsc-event-pipeline-kata/python/question.md) already covered where the
-interpreter may switch threads, what an uncontended lock costs against a per-event budget, and why
-timed waits are coarser than they claim. This one assumes all three.
-
 Same rules as the main kata: answer before opening the hint, and the fold at the bottom is the only
 place the shape is given.
 
@@ -31,6 +27,8 @@ consumer threads.
   with 32 × 16 threads — on a standard build, and on a free-threaded build (3.13t or 3.14t)
 - the throughput you can have, as a fraction of the brief's 5 M/s, and the p99 of one `put` against
   2 µs
+- what an uncontended `threading.Lock` acquire and release costs, measured on both builds, and what
+  fraction of the brief's per-event budget that one number is
 - which of steps 0–10 survive the change of scale intact, which become meaningless, and which change
   their answer
 - `multiprocessing`: what parallelism it buys, and what it charges per event to cross
@@ -40,8 +38,10 @@ consumer threads.
 
 Measure before designing; the number moves the whole track. The correctness questions do not depend
 on scale — a lost wakeup at ten thousand events a second is the same bug as at five million. The cost
-questions mostly do, and the one that changes most is the price of a lock, which you already know is
-not "basically free" here.
+questions mostly do, and the one that changes most is the price of a lock. Measure it before you
+design around it. "Uncontended, so basically free" is good advice in C++; whether it holds here
+depends on that number against your per-event budget, and the reason has nothing to do with
+contention.
 
 So the design that survives is the one whose correctness argument is cheapest to keep true — not the
 one that ported most faithfully.
@@ -61,8 +61,10 @@ track still has to answer.
   is actually stored, and whether any thread can observe the slot reserved but not filled
 - the same question on the free-threaded build: what makes `append` atomic there, and at what cost
 - build the brief's ring by hand — a preallocated `list` of 65,536 slots and two integer indices — and
-  find where it breaks. `self._tail += 1` is the first place to look; Kata 1's step P2 has the
-  mechanism
+  find where it breaks. `self._tail += 1` is the first place to look: say where the interpreter may
+  switch threads — it is not between any two bytecodes — read what `dis.dis` shows the increment
+  compiles to, and write a refactor that changes whether it loses updates without changing what it
+  means
 - "`None` means empty", one slot per index: construct the main kata's step-3 lap wrap in Python, with
   real threads, and show the event it loses
 - the per-slot sequence from step 3 needs a compare-and-swap. Find one in the standard library
@@ -79,6 +81,12 @@ The hand-built ring fails because the operations you would need to separate rese
 publication without a lock are not in the language: there is no atomic integer and no
 compare-and-swap. So the per-slot design cannot be written in Python at all, and the honest
 conclusion is a lock — which is the main kata's step 10, arrived at from the other side.
+
+On the increment, with the GIL: the interpreter checks whether to switch threads only at certain
+instructions — find the list — so whether a load, an add and a store can be split depends on what
+sits between them. Extracting a helper puts a call between the load and the store, and a call is
+one of those points. Safety that rests on where they fall is invisible to review and to testing,
+which is reason enough to treat it as broken.
 
 </details>
 
@@ -99,6 +107,8 @@ in the standard library. Read `Lib/queue.py` and check it against the brief.
 - what `put()` does to notify on every call, and what `Condition.notify` costs with nobody waiting
 - `maxsize`: blocking, a timeout, and `put_nowait` raising `Full` — which of the brief's two full
   policies each implements, and how a rejected event is counted (it is not, unless you count it)
+- a blocking `put` with a timeout is a timed wait. Time `Condition.wait` at 200 µs, 1 ms and 5 ms on
+  your platform before you trust the number you pass in
 - on the free-threaded build, where 48 threads now contend, and whether a batch API would help —
   and whether `queue.Queue` has one
 - `SimpleQueue`: what it gives up, what it gains, and which requirement of the brief it cannot meet
@@ -115,10 +125,15 @@ structure under free threading: every `put` and every `get` takes the same lock,
 contention the C++ track spends three steps on is concentrated in one place — and batching is the only
 lever left.
 
+On the timeout: `threading`'s timed waits do not necessarily use the high-resolution timer that
+`time.sleep` gained in 3.11, and on Windows the scheduler tick is about 15.6 ms. A deadline is only as
+fine as the wait that enforces it, and a 200 µs one that sleeps 15 ms shows up only in a tail you
+might blame on something else.
+
 </details>
 
 **Done when** you can say why `queue.Queue` cannot lose a wakeup, what `put` costs when nobody waits,
-and which full policy you use and where its drops are counted.
+which full policy you use and where its drops are counted, and the measured floor of a timed wait.
 
 ---
 

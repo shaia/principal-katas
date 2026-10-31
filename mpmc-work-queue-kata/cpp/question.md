@@ -9,11 +9,11 @@ manage by hand rather than one fact the runtime manages for you. It is also the 
 you choose, per operation, how much ordering to pay for — and that compiles a wrong choice without
 comment.
 
-[Kata 1's C++ track](../../mpsc-event-pipeline-kata/cpp/question.md) already covered the
-single-writer orderings, the Dekker fence, cache-line layout, and getting a thread sanitizer at all on
-Windows. This one starts where those stop: many writers, a slot reused across laps, an instruction
-set that has opinions about your progress guarantee, and waiting primitives that the standard added
-in C++20 and did not finish.
+The track asks what the shared steps can only ask generally: the ordering on every access when many
+threads write and a slot is reused across laps, the object a slot holds, an instruction set that has
+opinions about your progress guarantee and the lines your fields land on, waiting primitives that
+the standard added in C++20 and did not finish, and what a thread sanitizer can see once you have
+one.
 
 Same rules as the main kata: answer before opening the hint, and the fold at the bottom is the only
 place the shape is given.
@@ -29,7 +29,7 @@ Write `try_push` and `try_pop` for your step-3 design as code. Then annotate eve
 
 - the ordering on the reservation CAS, and why the answer is the weakest one available — the argument
   is one clause long, and it is about which location carries the data
-- the slot sequence's load and store on each side: there are two release/acquire pairs, as in Kata 1.
+- the slot sequence's load and store on each side: there are two release/acquire pairs, one each way.
   Name what each protects, and say which one is a *consumer of lap k* synchronizing with a *producer
   of lap k + 1*
 - the signed difference between sequence and position: write it so that it is defined behaviour in
@@ -127,6 +127,10 @@ can quietly downgrade yours.
 - `sizeof(Slot)` for a realistic event, slots per cache line, `alignas` on the slot versus on the
   array, the resulting footprint — and when the ring's pages are first touched, by which thread, on
   which NUMA node
+- the queue's own lines — the tail, the head, the sleeper state: the fields on each and the threads
+  that write them; `alignas(64)` against `std::hardware_destructive_interference_size`, and why one of
+  them does not belong in a type's layout; and the check that fails the *build* when a field added
+  later lands on a hot line
 
 <details>
 <summary>Hint</summary>
@@ -147,11 +151,19 @@ For first touch: a ring that has been allocated but never written has no physica
 lap faults on every one of them, *inside* producers' windows, and places each page on whichever node
 the faulting thread happened to be running on.
 
+For the queue's own lines, padding the two counters is the well-known move and not where a layout
+bug survives. Look at the fields nobody thinks of as hot: a count the consumers write on every idle
+pass, a flag the producer reads on every push, and whatever was declared after the one field that
+carries `alignas`. The standard constant can differ between translation units built with different
+tuning flags, which makes it a poor thing to bake into a type's ABI. A `static_assert` on `alignof`
+and `offsetof` makes the layout something the compiler checks rather than something a benchmark
+hints at.
+
 </details>
 
 **Done when** you can say whether your reservation instruction can retry on each target, give
-measured CAS retries per push at 32 producers, and say when and where the ring's pages were first
-touched.
+measured CAS retries per push at 32 producers, say when and where the ring's pages were first
+touched, and name the threads that write every line of the queue.
 
 ---
 
@@ -205,8 +217,8 @@ C++20 lacks.
 
 ## Step C5 — The bug the hardware hides and the tool cannot see
 
-Kata 1's C5 was about getting a thread sanitizer onto the target at all. This one is about what the
-tools see once you have them.
+ThreadSanitizer does not exist for `x86_64-pc-windows-msvc`, so on Windows the first job is getting
+it at all. The rest of the step is about what the tools see once you have them.
 
 Introduce four deliberate bugs, one at a time: the slot-sequence **load** made `relaxed`, the
 slot-sequence **store** made `relaxed`, the wakeup **fence removed**, and the **full check removed**.
@@ -216,6 +228,9 @@ on AArch64, ThreadSanitizer, and a model checker. Then run what you have.
 **Be prepared to say:**
 
 - your sixteen predictions, written down before anything runs
+- how you get ThreadSanitizer for a Windows target at all, and what a clean run under another
+  compiler, standard library and kernel wait tells you about the binary you ship — and what it does
+  not
 - what ThreadSanitizer does with a standalone `std::atomic_thread_fence` — build one with
   `-fsanitize=thread` and see what your compiler tells you — and therefore which of the four bugs it
   cannot judge, in either direction
@@ -232,6 +247,10 @@ ThreadSanitizer reasons about the C++ happens-before relation, not about the har
 can find a relaxed sequence on x86, where the hardware hides it: the payload access becomes a race in
 the *model* even though TSO would have ordered it in practice. It does not model standalone fences,
 so a protocol that depends on one lies outside what it can judge.
+
+On Windows the usual route is the same sources built with GCC or Clang under WSL or on Linux. That
+judges the protocol's orderings. It says nothing about the MSVC standard library's waiting
+primitives or `WaitOnAddress`, which are code it never ran.
 
 A model checker covers that gap, exhaustively, for small configurations. A stress test on x86 is the
 weakest of the four instruments and should be named as such — with one exception worth predicting

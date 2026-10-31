@@ -10,10 +10,9 @@ whether it meets the one requirement it may not. After that the track ports the 
 hand, and finds two things in this kata with no direct Go spelling: a sleep that compares a value
 before blocking, and a preemption you never asked for.
 
-[Kata 1's Go track](../../mpsc-event-pipeline-kata/go/question.md) already established that
-`sync/atomic` gives you no orderings to choose, and what that costs on the publish path. This one does
-not repeat that; it asks what the absence of choice does to a protocol with *two* handoffs per slot
-and sixteen sleepers.
+`sync/atomic` gives you no orderings to choose: every operation is sequentially consistent, so every
+publish pays for the strongest one. Step G2 asks what that costs per push, and what the absence of
+choice does to a protocol with *two* handoffs per slot and sixteen sleepers.
 
 Same rules as the main kata: answer before opening the hint, and the fold at the bottom is the only
 place the shape is given.
@@ -217,8 +216,10 @@ The brief makes a promise about p99 enqueue latency. Decide how you would know w
 
 - `testing.B` with `RunParallel` versus a harness with fixed goroutine counts: which of them measures
   the brief's 32 × 16
-- recording p99 enqueue: the clock (Kata 1's Go track has a warning about it on Windows), the
-  histogram, and where the time a blocked send spends goes
+- recording p99 enqueue: the clock first — what the runtime derives `time.Now()`'s monotonic reading
+  from on your platform, and its smallest observable tick, found by calling it in a tight loop for a
+  few milliseconds and counting distinct values — then the histogram, and where the time a blocked
+  send spends goes
 - what `-race` does to timing and scheduling, and therefore which runs may report a latency at all
 - the arms: channel against ring; async preemption on and off; `GOMAXPROCS` at the core count and
   below 48 — and the result that would make you keep the channel
@@ -234,6 +235,10 @@ are worth carrying.
 
 If it does not, the finding is that Go's runtime already solved this queue well enough — which is a
 result, not a failure, and arguably the most useful one this track can produce.
+
+Measure the clock before any result depends on it. A clock can be cheap to read and still advance
+only about a thousand times a second, and then a p50 below one tick is not noisy: it is clean, stable
+and mostly zero, and it makes the port look faster than the C++ it was measured against.
 
 </details>
 
