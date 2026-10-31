@@ -3,8 +3,8 @@ package bench
 // Phase 6 — measure the tail you promised (step G6), and decide.
 //
 //  1. The brief's rate with every arm side by side, interleaved: the channel,
-//     the ring with each blocking push, and the ring with consumers that park
-//     without spinning first. Then the C++ track's other two rows
+//     the ring with each blocking push, and the ring with consumers that spin
+//     before parking, as the C++ design does. Then the C++ track's other two rows
 //     for the channel and the ticket: 16 × 8 at 5 M/s, and 32 × 16 at 1 M/s.
 //  2. The decision, written before the run: the ring is kept only if its p99
 //     beats the channel's in every repetition, not only at the median.
@@ -66,7 +66,7 @@ func Phase6() {
 		{name: "channel, fast path", make: chanWith(sendFast)},
 		{name: "ring, Push (ticket)", make: ringTicket},
 		{name: "ring, PushContext (CAS)", make: ringCAS},
-		{name: "ring, Push, park at once", make: ringWith(true, turnstile.Variant{NoSpin: true})},
+		{name: "ring, Push, spin, then park", make: ringWith(true, turnstile.Variant{SpinFirst: true})},
 	}
 	res := interleave(arms, 3, briefSpec(), "the tail at 32 x 16")
 	fmt.Printf("  32 x 16 at 5 M/s, block on full, consumers spend %s per event; median of 3:\n", Ns(WorkNs))

@@ -13,6 +13,7 @@ import (
 // unless it says otherwise.
 func TestMain(m *testing.M) {
 	platform.SetPowerThrottling(false)
+	platform.KeepAwake()
 	Clk = tsc.Calibrate()
 	os.Exit(m.Run())
 }

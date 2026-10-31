@@ -5,17 +5,41 @@
 package platform
 
 import (
+	"runtime"
 	"syscall"
 	"unsafe"
 )
 
 var (
-	kernel32              = syscall.NewLazyDLL("kernel32.dll")
-	setProcessInformation = kernel32.NewProc("SetProcessInformation")
-	setThreadAffinityMask = kernel32.NewProc("SetThreadAffinityMask")
-	getCurrentThread      = kernel32.NewProc("GetCurrentThread")
-	getProcessTimes       = kernel32.NewProc("GetProcessTimes")
+	kernel32                = syscall.NewLazyDLL("kernel32.dll")
+	setProcessInformation   = kernel32.NewProc("SetProcessInformation")
+	setThreadAffinityMask   = kernel32.NewProc("SetThreadAffinityMask")
+	getCurrentThread        = kernel32.NewProc("GetCurrentThread")
+	getProcessTimes         = kernel32.NewProc("GetProcessTimes")
+	setThreadExecutionState = kernel32.NewProc("SetThreadExecutionState")
 )
+
+// KeepAwake asks Windows not to let the machine go idle into sleep or Modern
+// Standby while this process runs. A laptop that enters standby mid-run
+// suspends the process: its measurements stop meaning anything, and on resume
+// every timer that counts suspended time — the watchdog's included — fires at
+// once, which reads as a hang. Twice in this kata's history it did exactly
+// that. The request belongs to a thread, so a goroutine locked to one holds it
+// for the life of the process. Closing the lid still forces standby.
+func KeepAwake() error {
+	const esContinuous, esSystemRequired, esDisplayRequired = 0x80000000, 0x1, 0x2
+	errs := make(chan error)
+	go func() {
+		runtime.LockOSThread() // never unlocked: the thread lives as long as the request should
+		if r, _, err := setThreadExecutionState.Call(esContinuous | esSystemRequired | esDisplayRequired); r == 0 {
+			errs <- err
+			return
+		}
+		errs <- nil
+		select {}
+	}()
+	return <-errs
+}
 
 // SetPowerThrottling opts the process into or out of EcoQoS. Windows throttles
 // a console process that is not in the foreground — threads steered to the

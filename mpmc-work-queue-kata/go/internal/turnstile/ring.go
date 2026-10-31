@@ -62,9 +62,9 @@ const (
 	closedBit = 1
 	dead      = 1 << 63
 
-	// A consumer spins this many PAUSE instructions before parking: a producer
-	// mid-window publishes within nanoseconds unless it has been descheduled,
-	// and a park costs microseconds. Variant.NoSpin measures whether it pays.
+	// A ticket holder spins this many PAUSE instructions on its slot before it
+	// yields. Consumers do not spin before parking: measured, it bought nothing
+	// here, and Variant.SpinFirst keeps it as the comparison.
 	spins = 128
 	// A ticket holder whose slot is still occupied yields this many times, then
 	// sleeps between checks. It is waiting on a full ring, whose pace the
@@ -362,7 +362,7 @@ func (c *Consumer[T]) TryPop() (T, bool) { return c.q.tryPop(&c.stats) }
 func (c *Consumer[T]) Pop() (T, error) { return c.PopContext(context.Background()) }
 
 // PopContext is Pop with a deadline: it returns ctx.Err() when ctx is done
-// first. It spins briefly, then parks.
+// first. It parks as soon as the ring is empty.
 func (c *Consumer[T]) PopContext(ctx context.Context) (T, error) {
 	q, st := c.q, &c.stats
 	var zero T
@@ -370,7 +370,7 @@ func (c *Consumer[T]) PopContext(ctx context.Context) (T, error) {
 		if v, ok := q.tryPop(st); ok {
 			return v, nil
 		}
-		if q.v == nil || !q.v.NoSpin {
+		if q.v != nil && q.v.SpinFirst {
 			for i := 0; i < spins && !q.headPublished(); i++ {
 				tsc.Pause()
 			}

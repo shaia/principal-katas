@@ -9,6 +9,8 @@ import (
 
 func SetPowerThrottling(bool) error { return nil }
 
+func KeepAwake() error { return nil }
+
 func PinThread(int) error { return errors.ErrUnsupported }
 
 func ProcessCPU() float64 {

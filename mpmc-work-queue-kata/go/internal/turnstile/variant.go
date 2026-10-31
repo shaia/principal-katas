@@ -13,9 +13,10 @@ type Variant struct {
 	// SharedToken: consumers share one token channel and a count of sleepers,
 	// instead of a channel each and a bitmap.
 	SharedToken bool
-	// NoSpin: a consumer that finds the ring empty parks at once, rather than
-	// spinning first in case a producer is mid-window.
-	NoSpin bool
+	// SpinFirst: a consumer that finds the ring empty spins 128 PAUSE
+	// instructions, in case a producer is mid-window, before it parks — the C++
+	// track's design, which in Go measured no better than parking at once.
+	SpinFirst bool
 	// Spin: consumers never park. With Yield they call runtime.Gosched between
 	// spins.
 	Spin, Yield bool

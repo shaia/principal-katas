@@ -39,7 +39,8 @@ var holeArms = []struct {
 	{"a tight spin, no calls in the loop", true, turnstile.Variant{}},
 	{"Pop, spin only", false, turnstile.Variant{Spin: true}},
 	{"Pop, spin with Gosched", false, turnstile.Variant{Spin: true, Yield: true}},
-	{"Pop, spin, then park (the ring's)", false, turnstile.Variant{}},
+	{"Pop, spin 128 PAUSEs, then park", false, turnstile.Variant{SpinFirst: true}},
+	{"Pop, park at once (the ring's)", false, turnstile.Variant{}},
 }
 
 // holeResult is, per arm, every trial's hole in nanoseconds.

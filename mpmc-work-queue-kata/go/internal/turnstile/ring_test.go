@@ -18,6 +18,7 @@ import (
 // that is not in the foreground unless it says otherwise.
 func TestMain(m *testing.M) {
 	platform.SetPowerThrottling(false)
+	platform.KeepAwake()
 	os.Exit(m.Run())
 }
 
