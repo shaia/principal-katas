@@ -1,8 +1,8 @@
 # A bounded MPMC work queue, and the slot that is reserved but not yet there
 
 Answer to [../question.md](../question.md) and the [C++ track](question.md), with a working
-implementation and benchmarks alongside it. The Go and Python tracks are not written yet; their
-questions are at [../go/question.md](../go/question.md) and
+implementation and benchmarks alongside it. The Go answer is
+[../go/solution.md](../go/solution.md); the Python track is not written yet, and its questions are at
 [../python/question.md](../python/question.md).
 
 Every number below came from running [`bin/solution.exe`](bench/), whose exit code is the verdict,
@@ -697,6 +697,12 @@ was due rather than from when it was pushed, so that it is not hidden.
   per source (§13); neither is measured beyond the per-consumer order check.
 - The FIFO-versus-processing-order inversion count was planned and not built.
 - Work stealing between per-producer rings, the fix for §13's hot source, is not built.
+- Found while porting to Go: a ticket taken after the close is paid with a tombstone, and waits for its
+  slot first. If more producers than slots pass the pre-check, and the consumers then drain and leave,
+  the ticket that maps onto an earlier tombstone waits for a release that never comes. No ring here is
+  smaller than its producer count, so no run can reach it. The Go ring drains to the position recorded
+  at the close instead ([go §5](../go/solution.md#5-close-is-a-panic-on-the-send-side-g5)); this queue
+  is not changed.
 
 ---
 
