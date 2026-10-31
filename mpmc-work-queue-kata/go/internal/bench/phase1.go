@@ -5,12 +5,13 @@ package bench
 //  1. A buffered channel of 65,536, saturated, at 1, 8 and 32 senders against
 //     1, 4 and 16 receivers: what one event costs, and how that moves with
 //     contention on the one lock.
-//  2. One goroutine, no contention: a send and a receive, the reject path —
-//     a non-blocking send to a full channel — and the ring for scale.
-//  3. The number that decides whether to go further: the p99 of a send at
+//  2. The number that decides whether to go further: the p99 of a send at
 //     32 × 16 at the brief's 5 M/s, for the three ways a producer can send.
-//  4. Why, measured twice: one receive timed by itself with the buffer kept
+//  3. Why, measured twice: one receive timed by itself with the buffer kept
 //     full, and the runtime's own lock-contention profile of the brief's run.
+//
+// What single channel operations cost, one goroutine at a time and all at
+// once, is a set of ordinary benchmarks: go test -bench Channel ./internal/bench/.
 
 import (
 	"bytes"
@@ -34,7 +35,7 @@ type contention struct {
 
 // The contention profile needs GODEBUG=runtimecontentionstacks=1 to charge a
 // runtime lock's waiting to the code that waited, so it runs as a child.
-func init() { profiled("chan-contention", chanWith(turnstile.SendFast), briefSpec) }
+func init() { profiled("chan-contention", chanWith(sendFast), briefSpec) }
 
 // parseContention sums the mutex profile's delay, in seconds, by where each
 // record's stack waited: a blocking select (a sleep, in the ring's waiters), a
@@ -166,7 +167,7 @@ func Phase1() {
 	for rep := 0; rep < 3; rep++ {
 		for _, s := range senders {
 			for _, r := range receivers {
-				res := Run(chanWith(turnstile.SendPlain)(), Spec{Producers: s, Consumers: r, Events: total / uint64(s)})
+				res := Run(chanWith(sendPlain)(), Spec{Producers: s, Consumers: r, Events: total / uint64(s)})
 				CheckRun(&res, fmt.Sprintf("channel, %d x %d saturated", s, r))
 				grid[[2]int{s, r}] = append(grid[[2]int{s, r}], res)
 			}
@@ -191,56 +192,12 @@ func Phase1() {
 		Median(g, func(r Result) float64 { return float64(r.Mallocs) / float64(r.Accepted) }),
 		Median(g, func(r Result) float64 { return float64(r.GCs) }))
 
-	// 2. One goroutine.
-	fmt.Printf("\n  one goroutine, nothing contended, median of 3 x %d:\n", perOpN)
-	e := turnstile.MakeEvent(0, 0, 0)
-	room, full, empty, done := make(chan ev, 1024), make(chan ev, 1), make(chan ev, 1), make(chan struct{})
-	full <- e
-	r := turnstile.NewRing[ev, turnstile.LinePad](1024, turnstile.Options{})
-	var st turnstile.OpStats
-	var out ev
-	for _, c := range []struct {
-		what string
-		op   func()
-	}{
-		{"an empty call (included in every row)", func() {}},
-		{"send, then receive — room, nobody parked", func() { room <- e; <-room }},
-		{"select{send; <-done}, then receive", func() {
-			select {
-			case room <- e:
-			case <-done:
-			}
-			<-room
-		}},
-		{"non-blocking send to a full channel", func() {
-			select {
-			case full <- e:
-			default:
-			}
-		}},
-		{"non-blocking receive, empty channel", func() {
-			select {
-			case <-empty:
-			default:
-			}
-		}},
-		{"ring: TryPush, then TryPop", func() { r.TryPush(e, &st); r.TryPop(&out, &st) }},
-	} {
-		fmt.Printf("    %-42s %8s\n", c.what, Ns(perOp(c.op)))
-	}
-	fmt.Printf("    %-42s %8s\n", "non-blocking send to a full one, 32 at once", Ns(perOpParallel(32, func() {
-		select {
-		case full <- e:
-		default:
-		}
-	})))
-
-	// 3. The brief.
+	// 2. The brief.
 	spec := Spec{Producers: Producers, Consumers: Consumers, Rate: BriefRate, Seconds: 1, WorkNs: WorkNs, Latency: true}
 	arms := []arm{
-		{name: "bare send", make: chanWith(turnstile.SendPlain)},
-		{name: "select over send and done", make: chanWith(turnstile.SendSelect)},
-		{name: "fast path, then select", make: chanWith(turnstile.SendFast)},
+		{name: "bare send", make: chanWith(sendPlain)},
+		{name: "select over send and done", make: chanWith(sendSelect)},
+		{name: "fast path, then select", make: chanWith(sendFast)},
 	}
 	res := interleave(arms, 3, spec, "channel at the brief's rate")
 	fmt.Printf("\n  32 x 16 at 5 M/s, block on full, consumers spend %s per event; median of 3:\n", Ns(WorkNs))
@@ -255,7 +212,7 @@ func Phase1() {
 	}
 	fmt.Printf("    the channel's p99 send, %s, %s the brief's 2 us\n", Ns(p99), verdict)
 
-	// 4. Why.
+	// 3. Why.
 	fmt.Printf("\n  one receive, timed by itself: 16 consumers, the buffer kept full by producers that\n" +
 		"  reject and yield, so every receive finds an event waiting:\n")
 	fmt.Printf("    %-10s %-10s %10s %10s %10s %10s\n", "producers", "work", "throughput", "recv p50", "p99", "p99.9")
@@ -280,41 +237,4 @@ func Phase1() {
 	fmt.Printf("    estimated waiting for runtime locks: %.0f s across a %.2f s run; %.0f %% of it in channel\n"+
 		"    receives, %.0f %% in channel sends, %.0f %% elsewhere\n",
 		c.Total, c.Seconds, 100*c.Recv/c.Total, 100*(c.Send+c.Select)/c.Total, 100*c.Other/c.Total)
-}
-
-const perOpN = 1 << 20
-
-// perOp is the median of three timings of n calls of op, per call.
-func perOp(op func()) float64 {
-	v := make([]float64, 3)
-	for i := range v {
-		t0 := tsc.Ticks()
-		for j := 0; j < perOpN; j++ {
-			op()
-		}
-		v[i] = Clk.Ns(tsc.Ticks()-t0) / perOpN
-	}
-	return Median(v, func(x float64) float64 { return x })
-}
-
-// perOpParallel is per-call time when g goroutines each call op perOpN times at
-// once: the wall time divided by each goroutine's count.
-func perOpParallel(g int, op func()) float64 {
-	var wg sync.WaitGroup
-	var gate sync.WaitGroup
-	gate.Add(1)
-	wg.Add(g)
-	for i := 0; i < g; i++ {
-		go func() {
-			defer wg.Done()
-			gate.Wait()
-			for j := 0; j < perOpN; j++ {
-				op()
-			}
-		}()
-	}
-	t0 := tsc.Ticks()
-	gate.Done()
-	wg.Wait()
-	return Clk.Ns(tsc.Ticks()-t0) / perOpN
 }
