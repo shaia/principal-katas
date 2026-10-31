@@ -73,7 +73,7 @@ unobservable rather than representable, already touches it few enough times.
 | | thesis |
 |---|---|
 | [**cpp/solution.md**](cpp/solution.md) | Reservation lives in the counter, publication in the slot, as a lap-stamped sequence. Two entry points on one tail word: a CAS `try_push` that can refuse, and a ticket `push` that never retries and pays a tombstone if it lands after a close. The result is **blocking in the progress sense with no lock in it** — one descheduled producer stops every consumer, and on this machine that happens six times in eight million pushes. Against the brief: tickets meet the 2 µs p99 at 16 × 8 (1.90 µs) and miss it at 32 × 16 by half (2.96 µs), on 32 CPUs that the brief's 48 threads oversubscribe. The question's own outline proposes one ring per producer instead. Measured in §13, that meets the p99 at 32 × 16 by giving up the shared head, so which design is right turns on whether the 32 sources are balanced. |
-| go/solution.md | not written — [go/question.md](go/question.md) |
+| [**go/solution.md**](go/solution.md) | The runtime already wrote the queue, and it is the main kata's step-10 mutex: a buffered channel answers every correctness step by construction, and at the brief's workload it moves **1.76 M/s against 5 M/s offered**, with a 461 µs p99 send. Saturated with nothing to do it is as fast as the ring; with consumers doing 1 µs of work, its one lock makes a receive's p99 exceed 100 µs. The per-slot ring ports intact with no orderings to choose, and **meets the p99 at 32 × 16 (1.11 µs)**. The sleep is a token channel per sleeper behind a bitmap, because one shared token channel recreated the channel's lock problem (91.4 µs against 1.53 µs at 200 k/s). Under the C++ harness's bursts the same ring's p99 doubles to 2.01 µs, so the gap between the two tracks is mostly how their producers sleep. |
 | python/solution.md | not written — [python/question.md](python/question.md) |
 
 ## Notable results
@@ -111,6 +111,20 @@ unobservable rather than representable, already touches it few enough times.
   every push lost 0 wakeups in 80,000. It costs the producer a wake whenever a consumer sleeps: at
   20 k/s its push p99 was 42.3 µs against the event count's 11.0 µs, and the event's own wait was
   shorter. ([cpp §13](cpp/solution.md#13-the-reference-outline-checked))
+- **Go's channel does not meet the brief, and the reason is its lock, not its speed.** Saturated at
+  32 × 16 it moved 5.6–7.6 M/s, as fast as the ring. With consumers spending 1 µs per event it moved
+  1.76 M/s, because one receive, with an event already waiting, had a p99 of 105–244 µs. The runtime's
+  own contention profile put 60 % of the waiting in receives.
+  ([go §1](go/solution.md#1-the-runtime-already-wrote-this-queue-g1))
+- **The cross-track gap is mostly the pacer.** Both harnesses nap 200 µs between bursts; Go's timer
+  returns in 0.6 ms, C++'s `sleep_for` in 37 ms, so a C++ producer pushes 5,800 events back to back
+  where a Go one pushes 97. Given the C++ traffic, the Go ring's p99 at 32 × 16 rose from 1.11 µs to
+  2.01 µs. ([go §6](go/solution.md#6-measure-the-tail-you-promised-g6))
+- **A spinning consumer can keep the producer it waits for off the CPU for as long as it spins.**
+  With every P held by consumers spinning on a hole in a loop with no calls in it, the producer that
+  owned the hole ran again after 31 ms, the runtime's 10 ms forced preemption several times over —
+  and with asynchronous preemption off, not until the spinners gave up. Spinning briefly and then
+  parking let it back in 6.5 µs. ([go §4](go/solution.md#4-preemption-you-did-not-schedule-g4))
 - **Windows throttled the benchmark to a quarter of its speed for not being in the foreground.**
   8 × 4 saturated: 2.16 M/s with EcoQoS on, 8.75 M/s off, in one run. Single-thread pinned numbers
   never moved, which is why it took a while to see.
@@ -125,6 +139,17 @@ cpp/bin/solution.exe                   # exit code is the verdict; about seven m
 cpp/bin/solution.exe --phase 2,8       # the correctness phases only
 cpp/bin/solution.exe --phase 9         # the reference outline's alternatives
 cpp/bin/solution.exe --bug no-fence    # one row of the bug x tool table
+```
+
+```sh
+cd go
+go vet ./... && go test ./...
+go build -o bin/turnstile.exe ./cmd/turnstile
+bin/turnstile.exe                      # exit code is the verdict; about three and a half minutes
+bin/turnstile.exe -phase 6             # the tail, and the decision
+bin/turnstile.exe -bug late-announce   # one row of the Go bug x tool table
+# the race detector needs cgo and gcc (WinLibs); see go/solution.md, Layout
+CGO_ENABLED=1 CC=gcc go test -race ./...
 ```
 
 Run it **twice and read the second**, and do not compare numbers across runs: on this laptop the clock
@@ -156,7 +181,8 @@ mpmc-work-queue-kata/
   question.md          the kata — 11 steps, the rubric, the folded answer sketch
   reference-outline.md the answer outline that came with the question, checked in cpp §13
   cpp/                 question.md solution.md  src/ bench/ CMakeLists.txt  -> bin/solution.exe
-  go/question.md       G1–G6   the runtime already wrote it · the port without orderings · a sleep without a futex · runtime preemption · close panics · the tail
+  go/                  question.md solution.md  internal/ cmd/ go.mod  -> bin/turnstile.exe
+                       G1–G6   the runtime already wrote it · the port without orderings · a sleep without a futex · runtime preemption · close panics · the tail
   python/question.md   P1–P6   the ceiling · reserving is publishing · read Lib/queue.py · lose the GIL · critique Queue.shutdown · multiprocessing's feeder
 ```
 

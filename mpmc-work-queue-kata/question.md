@@ -635,8 +635,8 @@ apart again, further than in either of the others.
 
 Do steps 0–10 first; each track assumes you have an answer to defend.
 
-Answers, once you have yours: [cpp/solution.md](cpp/solution.md). The Go and Python answers are not
-written yet. The answer outline that came with the question is in
+Answers, once you have yours: [cpp/solution.md](cpp/solution.md) and [go/solution.md](go/solution.md).
+The Python answer is not written yet. The answer outline that came with the question is in
 [reference-outline.md](reference-outline.md), and
 [cpp §13](cpp/solution.md#13-the-reference-outline-checked) checks it against measurements.
 
