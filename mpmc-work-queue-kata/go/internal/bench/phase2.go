@@ -2,8 +2,9 @@ package bench
 
 // Phase 2 — port the slot protocol (step G2): the invariants, on every arm.
 //
-//  1. Full size, saturated, 32 × 16: both reservations, both full policies and
-//     both at once, consumers that never sleep, and the channel three ways.
+//  1. Full size, saturated, 32 × 16: both blocking pushes, the reject policy
+//     and a mix, consumers that never sleep, packed slots, and the channel
+//     three ways.
 //  2. Four slots, 8 × 8: a lap wraps every four events with slots still
 //     reserved, which is where a protocol that only looks right fails.
 //  3. No consumer: exactly 65,536 accepted, none overwritten.
@@ -30,31 +31,31 @@ func Phase2() {
 	}
 	block, reject, mixed := full, full, full
 	reject.Mode, mixed.Mode = Reject, Mixed
-	row("ring, CAS, block", ringCAS(), block)
-	row("ring, ticket, block", ringTicket(), block)
-	row("ring, reject", ringCAS(), reject)
-	row("ring, half reject, half ticket", ringTicket(), mixed)
-	row("ring, consumers never sleep", ringWith(turnstile.Options{Spin: true})(), block)
-	row("channel, bare send", chanWith(turnstile.SendPlain)(), block)
-	row("channel, select over send and done", chanWith(turnstile.SendSelect)(), block)
-	row("channel, fast path, then select", chanWith(turnstile.SendFast)(), block)
-	row("channel, reject", chanWith(turnstile.SendFast)(), reject)
+	row("ring, Push (ticket)", ringTicket(), block)
+	row("ring, PushContext (CAS)", ringCAS(), block)
+	row("ring, TryPush", ringCAS(), reject)
+	row("ring, half TryPush, half Push", ringTicket(), mixed)
+	row("ring, consumers never sleep", ringWith(true, turnstile.Variant{Spin: true})(), block)
+	row("ring, slots packed", ringPacked(), block)
+	row("channel, bare send", chanWith(sendPlain)(), block)
+	row("channel, select over send and done", chanWith(sendSelect)(), block)
+	row("channel, fast path, then select", chanWith(sendFast)(), block)
+	row("channel, reject", chanWith(sendFast)(), reject)
 
 	tiny := Spec{Producers: 8, Consumers: 8, Events: 20_000 / scale}
 	fmt.Printf("  %d x %d on 4 slots, %d events per producer:\n", tiny.Producers, tiny.Consumers, tiny.Events)
-	four := func(o turnstile.Options) Queue { return turnstile.NewRing[ev, struct{}](4, o) }
 	tb, tr, tm := tiny, tiny, tiny
 	tr.Mode, tm.Mode = Reject, Mixed
-	row("4 slots, CAS, block", four(turnstile.Options{}), tb)
-	row("4 slots, ticket, block", four(turnstile.Options{Reserve: turnstile.ReserveTicket}), tb)
-	row("4 slots, reject", four(turnstile.Options{}), tr)
-	row("4 slots, half reject, half ticket", four(turnstile.Options{Reserve: turnstile.ReserveTicket}), tm)
+	row("4 slots, Push (ticket)", packed(4, true), tb)
+	row("4 slots, PushContext (CAS)", packed(4, false), tb)
+	row("4 slots, TryPush", packed(4, false), tr)
+	row("4 slots, half TryPush, half Push", packed(4, true), tm)
 
 	// No consumer: 32 producers offer twice the capacity between them.
 	for _, c := range []struct {
 		name string
 		q    Queue
-	}{{"ring", ringCAS()}, {"channel", chanWith(turnstile.SendFast)()}} {
+	}{{"ring", ringCAS()}, {"channel", chanWith(sendFast)()}} {
 		r := Run(c.q, Spec{Producers: Producers, Consumers: 0, Events: 2 * Capacity / Producers, Mode: Reject})
 		Check(r.Offered == r.Accepted+r.Rejected, "%s, no consumers: offered == accepted + rejected", c.name)
 		Check(r.Accepted == Capacity, "%s: with no consumer, exactly 65,536 events are accepted — none overwritten (%d)",
@@ -71,10 +72,10 @@ func Phase2() {
 		q    func() (push func(*[1024]byte), pop func() *[1024]byte, keep any)
 	}{
 		{"ring, consumed slot zeroed", func() (func(*[1024]byte), func() *[1024]byte, any) {
-			return ringOfPointers(turnstile.Options{})
+			return ringOfPointers(turnstile.Variant{})
 		}},
 		{"ring, consumed slot left as it was", func() (func(*[1024]byte), func() *[1024]byte, any) {
-			return ringOfPointers(turnstile.Options{Retain: true})
+			return ringOfPointers(turnstile.Variant{Retain: true})
 		}},
 		{"channel", func() (func(*[1024]byte), func() *[1024]byte, any) {
 			ch := make(chan *[1024]byte, 1024)
@@ -91,11 +92,10 @@ func Phase2() {
 	}
 }
 
-func ringOfPointers(o turnstile.Options) (func(*[1024]byte), func() *[1024]byte, any) {
-	r := turnstile.NewRing[*[1024]byte, struct{}](1024, o)
-	var st turnstile.OpStats
-	return func(p *[1024]byte) { r.TryPush(p, &st) },
-		func() *[1024]byte { var p *[1024]byte; r.TryPop(&p, &st); return p }, r
+func ringOfPointers(v turnstile.Variant) (func(*[1024]byte), func() *[1024]byte, any) {
+	q := turnstile.NewVariant[*[1024]byte](1024, v)
+	p, c := q.Producer(), q.Consumer()
+	return func(r *[1024]byte) { p.TryPush(r) }, func() *[1024]byte { r, _ := c.TryPop(); return r }, q
 }
 
 func retained(push func(*[1024]byte), pop func() *[1024]byte) int {

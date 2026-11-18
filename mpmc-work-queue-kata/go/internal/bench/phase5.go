@@ -5,17 +5,15 @@ package bench
 //  1. Close under load: 32 producers at 1 M/s, closed 200 ms in, for every
 //     arm. Every producer must be refused, every accepted event consumed —
 //     and the textbook select can accept an event after shutdown began.
-//  2. The panic the protocol exists to avoid: a send on a closed channel.
-//  3. What a producer pays per push to learn that shutdown has begun.
+//
+// The panic the protocol exists to avoid — a send on a closed channel — is a
+// test (TestSendOnClosedChannelPanics), and what a producer pays per push to
+// learn that shutdown has begun is a benchmark (BenchmarkShutdownCheck).
 
 import (
-	"context"
 	"fmt"
 	"strings"
-	"sync/atomic"
 	"time"
-
-	"turnstile/internal/turnstile"
 )
 
 func Phase5() {
@@ -26,12 +24,12 @@ func Phase5() {
 		CloseAfter: 200 * time.Millisecond}
 	reject := func(s Spec) Spec { s.Mode = Reject; return s }
 	arms := []arm{
-		{name: "ring, CAS, block", make: ringCAS},
-		{name: "ring, ticket, block", make: ringTicket},
-		{name: "ring, reject", make: ringCAS, spec: reject},
-		{name: "channel, fast path, then select", make: chanWith(turnstile.SendFast)},
-		{name: "channel, select over send and done", make: chanWith(turnstile.SendSelect)},
-		{name: "channel, reject", make: chanWith(turnstile.SendFast), spec: reject},
+		{name: "ring, Push (ticket)", make: ringTicket},
+		{name: "ring, PushContext (CAS)", make: ringCAS},
+		{name: "ring, TryPush", make: ringCAS, spec: reject},
+		{name: "channel, fast path, then select", make: chanWith(sendFast)},
+		{name: "channel, select over send and done", make: chanWith(sendSelect)},
+		{name: "channel, reject", make: chanWith(sendFast), spec: reject},
 	}
 	const rounds = 5
 	res := interleave(arms, rounds, spec, "close under load")
@@ -56,69 +54,4 @@ func Phase5() {
 			Check(after == 0, "%s: no push that began after Close returned was accepted", a.name)
 		}
 	}
-
-	// 2. The panic.
-	q := turnstile.NewChan[ev](8, turnstile.SendFast)
-	q.ProducersDone()
-	var msg string
-	func() {
-		defer func() {
-			if err, ok := recover().(error); ok {
-				msg = err.Error()
-			}
-		}()
-		var st turnstile.OpStats
-		q.TryPush(turnstile.MakeEvent(0, 0, 0), &st)
-	}()
-	Check(msg == "send on closed channel", "a send on a closed channel panics with the runtime's message (%q)", msg)
-	fmt.Printf("\n  a send on a closed data channel: panic(%q), recovered here, and fatal anywhere it is not\n", msg)
-
-	// 3. The per-push check.
-	var flag atomic.Bool
-	done := make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ctxDone := ctx.Done()
-	fmt.Printf("\n  learning that shutdown has begun, per push, while it has not:\n")
-	fmt.Printf("    %-50s %10s %12s\n", "", "alone", "32 at once")
-	sink := 0
-	for _, c := range []struct {
-		what string
-		op   func()
-	}{
-		{"an atomic.Bool load", func() {
-			if flag.Load() {
-				sink++
-			}
-		}},
-		{"select { case <-done: default: }", func() {
-			select {
-			case <-done:
-				sink++
-			default:
-			}
-		}},
-		{"ctx.Err() != nil", func() {
-			if ctx.Err() != nil {
-				sink++
-			}
-		}},
-		{"select { case <-ctx.Done(): default: }", func() {
-			select {
-			case <-ctx.Done():
-				sink++
-			default:
-			}
-		}},
-		{"the same, with Done() read once outside the loop", func() {
-			select {
-			case <-ctxDone:
-				sink++
-			default:
-			}
-		}},
-	} {
-		fmt.Printf("    %-50s %10s %12s\n", c.what, Ns(perOp(c.op)), Ns(perOpParallel(32, c.op)))
-	}
-	Check(sink == 0, "nothing reported shutdown while none had begun")
 }

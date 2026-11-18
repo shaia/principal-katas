@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"errors"
 	"math"
 	"runtime"
 	"sync"
@@ -11,15 +12,27 @@ import (
 	"turnstile/internal/turnstile"
 )
 
-// Queue is what the driver runs: Ring and ChanQueue both satisfy it.
+// Queue is what the driver runs. Each goroutine takes its own handle, as the
+// ring's API asks; a channel's handles are thin.
 type Queue interface {
-	TryPush(e turnstile.Event, st *turnstile.OpStats) turnstile.Push
-	Push(e turnstile.Event, until time.Time, st *turnstile.OpStats) turnstile.Push
-	TryPop(e *turnstile.Event, st *turnstile.OpStats) turnstile.Pop
-	Pop(e *turnstile.Event, until time.Time, st *turnstile.OpStats) turnstile.Pop
+	Producer() Producer
+	Consumer() Consumer
 	Close()
+	// ProducersDone is called once every producer has returned from its last
+	// push: the moment a channel's data channel can be closed.
 	ProducersDone()
-	Occupancy() uint64
+	Len() int
+}
+
+type Producer interface {
+	TryPush(e turnstile.Event) error // nil, turnstile.ErrFull or turnstile.ErrClosed
+	Push(e turnstile.Event) error    // the arm's blocking push: nil or turnstile.ErrClosed
+	Stats() turnstile.Stats
+}
+
+type Consumer interface {
+	Pop() (turnstile.Event, error) // turnstile.ErrClosed once drained
+	Stats() turnstile.Stats
 }
 
 // Mode is the producers' full policy. Mixed: even producers reject, odd ones
@@ -59,10 +72,9 @@ type Spec struct {
 	// sets the arrival process the queue sees as much as Rate does.
 	Nap time.Duration
 
-	WorkNs       float64
-	Mode         Mode
-	Latency      bool
-	BlockTimeout time.Duration // 2 s when zero
+	WorkNs  float64
+	Mode    Mode
+	Latency bool
 
 	// Close this long after the start, with producers still running.
 	CloseAfter time.Duration
@@ -84,7 +96,7 @@ type Result struct {
 	Ready Histogram // from when the event could first have been pushed to accepted
 	E2E   Histogram // push start to pop, across cores: phase 0 checks the counter skew
 
-	ProducerOps, ConsumerOps turnstile.OpStats
+	ProducerOps, ConsumerOps turnstile.Stats
 	Bursts                   uint64
 	ProducersUnfinished      int  // producers that ended on something other than their quota
 	ProducersRefused         int  // producers refused on full at least once
@@ -104,7 +116,7 @@ type producerState struct {
 	bursts                           uint64
 	finished                         bool
 	push, ready                      Histogram
-	ops                              turnstile.OpStats
+	ops                              turnstile.Stats
 }
 
 type consumerState struct {
@@ -114,15 +126,15 @@ type consumerState struct {
 	tLast        uint64
 	lastSeq      [Producers * 4]int64
 	e2e          Histogram
-	ops          turnstile.OpStats
+	ops          turnstile.Stats
 }
 
-func (s *producerState) account(r turnstile.Push, id, seq uint32, now uint64) {
+func (s *producerState) account(err error, id, seq uint32, now uint64) {
 	s.offered++
-	switch r {
-	case turnstile.PushOK:
+	switch {
+	case err == nil:
 		s.accepted.Add(id, seq)
-	case turnstile.PushClosed:
+	case errors.Is(err, turnstile.ErrClosed):
 		s.refusedClosed++
 	default:
 		s.rejected++
@@ -138,9 +150,6 @@ func Run(q Queue, spec Spec) Result {
 	P, C := spec.Producers, spec.Consumers
 	if spec.Nap == 0 {
 		spec.Nap = 200 * time.Microsecond
-	}
-	if spec.BlockTimeout == 0 {
-		spec.BlockTimeout = 2 * time.Second
 	}
 	ps := make([]producerState, P)
 	cs := make([]consumerState, max(C, 1))
@@ -185,31 +194,34 @@ func Run(q Queue, spec Spec) Result {
 					mode = Block
 				}
 			}
+			p := q.Producer()
+			defer func() { s.ops = p.Stats() }()
 			waitGo()
 			start := tGo.Load()
-			until := time.Now().Add(spec.BlockTimeout)
 
-			pushTimed := func(seq uint32, readyAt uint64) turnstile.Push {
+			// pushTimed reports whether the producer may go on: false once the
+			// queue has refused it as closed.
+			pushTimed := func(seq uint32, readyAt uint64) bool {
 				t0 := tsc.Ticks()
 				e := turnstile.MakeEvent(pid, seq, t0)
-				var r turnstile.Push
+				var err error
 				if mode == Reject {
-					r = q.TryPush(e, &s.ops)
+					err = p.TryPush(e)
 				} else {
-					r = q.Push(e, until, &s.ops)
+					err = p.Push(e)
 				}
 				t1 := tsc.Ticks()
 				if spec.Latency {
 					s.push.Record(t1 - t0)
 					s.ready.Record(t1 - min(readyAt, t0))
 				}
-				if r == turnstile.PushOK && spec.CloseAfter > 0 {
+				if err == nil && spec.CloseAfter > 0 {
 					if ct := closeTick.Load(); ct != 0 && t0 > ct {
 						s.afterClose++
 					}
 				}
-				s.account(r, pid, seq, t1)
-				return r
+				s.account(err, pid, seq, t1)
+				return !errors.Is(err, turnstile.ErrClosed)
 			}
 
 			if !paced {
@@ -218,10 +230,7 @@ func Run(q Queue, spec Spec) Result {
 					quota = math.MaxUint32
 				}
 				for i := uint64(0); i < quota; i++ {
-					if i&1023 == 0 {
-						until = time.Now().Add(spec.BlockTimeout)
-					}
-					if pushTimed(uint32(i), tsc.Ticks()) == turnstile.PushClosed {
+					if !pushTimed(uint32(i), tsc.Ticks()) {
 						break
 					}
 				}
@@ -240,15 +249,13 @@ func Run(q Queue, spec Spec) Result {
 						woke = tsc.Ticks()
 						continue
 					}
-					until = time.Now().Add(spec.BlockTimeout)
 					s.bursts++
 					for next <= now && next < end {
-						r := pushTimed(seq, max(next, woke))
+						open = pushTimed(seq, max(next, woke))
 						seq++
 						next += interval
 						now = tsc.Ticks()
-						if r == turnstile.PushClosed {
-							open = false
+						if !open {
 							break
 						}
 					}
@@ -267,19 +274,13 @@ func Run(q Queue, spec Spec) Result {
 			for i := range s.lastSeq {
 				s.lastSeq[i] = -1
 			}
-			forever := time.Now().Add(time.Hour)
-			// Declared once: its address goes through an interface method, so the
-			// compiler cannot keep it on the stack, and inside the loop it would be
-			// one heap allocation per event.
-			var ev turnstile.Event
+			c := q.Consumer()
+			defer func() { s.ops = c.Stats() }()
 			waitGo()
 			for {
-				r := q.Pop(&ev, forever, &s.ops)
-				if r == turnstile.PopDrained {
+				ev, err := c.Pop()
+				if errors.Is(err, turnstile.ErrClosed) {
 					return
-				}
-				if r != turnstile.PopOK {
-					continue
 				}
 				t := tsc.Ticks()
 				s.tLast = t
@@ -319,7 +320,7 @@ func Run(q Queue, spec Spec) Result {
 	var out Result
 	out.TGo = tGo.Load()
 	finish := func() {
-		out.BacklogAtClose = q.Occupancy()
+		out.BacklogAtClose = uint64(q.Len())
 		out.TClose = tsc.Ticks()
 		q.Close()
 		closeTick.Store(tsc.Ticks())
@@ -350,7 +351,7 @@ func Run(q Queue, spec Spec) Result {
 		out.AfterClose += s.afterClose
 		out.Push.Merge(&s.push)
 		out.Ready.Merge(&s.ready)
-		out.ProducerOps.Merge(&s.ops)
+		out.ProducerOps.Add(s.ops)
 		out.Bursts += s.bursts
 		if !s.finished {
 			out.ProducersUnfinished++
@@ -368,7 +369,7 @@ func Run(q Queue, spec Spec) Result {
 		out.Torn += s.torn
 		out.Disorder += s.disord
 		out.E2E.Merge(&s.e2e)
-		out.ConsumerOps.Merge(&s.ops)
+		out.ConsumerOps.Add(s.ops)
 		out.TEnd = max(out.TEnd, s.tLast)
 	}
 	out.Accepted, out.Consumed = accepted.N, consumed.N

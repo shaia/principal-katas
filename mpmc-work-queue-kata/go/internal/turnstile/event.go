@@ -1,5 +1,7 @@
 package turnstile
 
+import "unsafe"
+
 // Event is what crosses the queue: 32 bytes, with no pointers in it, carrying
 // enough to check every delivery the moment it arrives.
 type Event struct {
@@ -9,6 +11,22 @@ type Event struct {
 	Payload  uint64
 	Check    uint64 // digest of the other four fields
 }
+
+// LineEvent is an Event padded so that its slot in a Ring — the 8-byte
+// sequence, then the value — is one 64-byte cache line exactly, and adjacent
+// slots, written by different producers and read by different consumers, never
+// share a line. Ring[Event] packs them instead; the benchmark runs both.
+type LineEvent struct {
+	Event
+	_ [24]byte
+}
+
+// The build fails here, not a benchmark, if a LineEvent slot stops being one
+// line.
+var (
+	_ [64 - unsafe.Sizeof(slot[LineEvent]{})]byte
+	_ [unsafe.Sizeof(slot[LineEvent]{}) - 64]byte
+)
 
 // mix is splitmix64's finalizer: cheap, and every input bit reaches every
 // output bit.

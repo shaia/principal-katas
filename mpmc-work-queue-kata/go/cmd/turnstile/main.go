@@ -25,6 +25,9 @@ func main() {
 	if err := platform.SetPowerThrottling(false); err != nil {
 		fmt.Printf("  note: could not opt out of power throttling: %v\n", err)
 	}
+	if err := platform.KeepAwake(); err != nil {
+		fmt.Printf("  note: could not keep the machine awake: %v\n", err)
+	}
 	if v := os.Getenv("TURNSTILE_NS_PER_TICK"); v != "" {
 		ns, err := strconv.ParseFloat(v, 64)
 		if err != nil {

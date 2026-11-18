@@ -2,15 +2,17 @@ package bench
 
 // Phase 3 — build the sleep without a futex (step G3).
 //
-//  1. What a push's wake decision costs when nobody is asleep — which at 5 M/s
-//     is nearly every push — for each primitive, alone and 32 at once.
-//  2. What a wake costs when someone is: the waker's own time, and how long the
-//     sleeper takes to run.
-//  3. A race engineered to lose a wakeup, against the real protocol and against
+//  1. What a wake costs when someone is asleep: the waker's own time, and how
+//     long the sleeper takes to run.
+//  2. A race engineered to lose a wakeup, against the real protocol and against
 //     one with two statements in the wrong order. Go has no fence to forget;
 //     it still has an order to get wrong.
-//  4. Consumers that really do sleep: low rates, where the queue is empty most
-//     of the time.
+//  3. Consumers that really do sleep: low rates, where the queue is empty most
+//     of the time; and the runtime's lock-contention profile of the two designs.
+//
+// What a push's wake decision costs when nobody is asleep — which at 5 M/s is
+// nearly every push — is a set of benchmarks: go test -bench Wake
+// ./internal/turnstile/.
 
 import (
 	"fmt"
@@ -28,44 +30,7 @@ import (
 func Phase3() {
 	Thermometer()
 
-	// 1. Nobody asleep.
-	bitmap := turnstile.NewWaiter(false)
-	counted := turnstile.NewWaiter(true)
-	// A token on every push with no count in front of it. Resting: it sits in a
-	// full channel, so each send fails on the lock-free full check. Never
-	// resting: a channel that is never full, so every send succeeds and takes the
-	// lock; its elements have no size, so the capacity costs no memory.
-	resting := make(chan struct{}, 1)
-	resting <- struct{}{}
-	sink := make(chan struct{}, 1<<26)
-	var mu sync.Mutex
-	cond := sync.NewCond(&mu)
-	fmt.Printf("  a push's wake decision with nobody asleep, per push:\n")
-	fmt.Printf("    %-50s %10s %12s\n", "", "alone", "32 at once")
-	for _, c := range []struct {
-		what string
-		op   func()
-	}{
-		{"a bitmap of sleepers (the ring's)", func() { bitmap.Notify() }},
-		{"a sleeper count, in front of one shared token", func() { counted.Notify() }},
-		{"a token on every push, resting in the channel", func() {
-			select {
-			case resting <- struct{}{}:
-			default:
-			}
-		}},
-		{"a token on every push, never resting", func() {
-			select {
-			case sink <- struct{}{}:
-			default:
-			}
-		}},
-		{"sync.Cond: Lock, Signal, Unlock", func() { mu.Lock(); cond.Signal(); mu.Unlock() }},
-	} {
-		fmt.Printf("    %-50s %10s %12s\n", c.what, Ns(perOp(c.op)), Ns(perOpParallel(32, c.op)))
-	}
-
-	// 2. Someone asleep.
+	// 1. Someone asleep.
 	fmt.Printf("\n  waking one sleeping goroutine, %d trials each; the waker's own time, and until the sleeper runs:\n",
 		wakeTrials)
 	fmt.Printf("    %-36s %10s %10s %14s %10s\n", "", "waker p50", "p99", "sleeper p50", "p99")
@@ -73,7 +38,7 @@ func Phase3() {
 		what string
 		run  func() (waker, sleeper Histogram)
 	}{
-		{"a token, claimed from the bitmap", wakeToken},
+		{"a push, to a consumer parked in Pop", wakeRing},
 		{"a send to a receiver parked on it", wakeChan},
 		{"sync.Cond.Signal", wakeCond},
 	} {
@@ -82,18 +47,19 @@ func Phase3() {
 			Ns(Q(&s, 0.99)))
 	}
 
-	// 3. The race.
+	// 2. The race.
 	const iterations = 20_000
 	fmt.Printf("\n  the engineered race, %d iterations per row, 2 ms backstop:\n", iterations/scale)
 	fmt.Printf("    %-30s %6s %10s %8s %8s %6s\n", "", "spread", "re-check", "woken", "LOST", "late")
 	lost := map[turnstile.Bug]int{}
 	for _, spread := range []int{64, 256, 1024, 4096} {
-		for _, b := range []turnstile.Bug{turnstile.BugNone, turnstile.BugLateAnnounce} {
-			r := wakeRace(b, iterations/scale, spread)
-			name := map[turnstile.Bug]string{turnstile.BugNone: "announce, then re-check",
-				turnstile.BugLateAnnounce: "re-check, then announce"}[b]
-			fmt.Printf("    %-30s %6d %10d %8d %8d %6d\n", name, spread, r.recheck, r.woken, r.lost, r.late)
-			lost[b] += r.lost
+		for _, order := range []struct {
+			name string
+			bug  turnstile.Bug
+		}{{"announce, then re-check", turnstile.BugNone}, {"re-check, then announce", turnstile.BugLateAnnounce}} {
+			r := wakeRace(order.bug, iterations/scale, spread)
+			fmt.Printf("    %-30s %6d %10d %8d %8d %6d\n", order.name, spread, r.recheck, r.woken, r.lost, r.late)
+			lost[order.bug] += r.lost
 		}
 	}
 	fmt.Printf("    spread = the consumer's random pause after its hook, in loop iterations;\n" +
@@ -102,15 +68,15 @@ func Phase3() {
 		lost[turnstile.BugNone], lost[turnstile.BugLateAnnounce])
 	Check(lost[turnstile.BugNone] == 0, "announcing before the re-check, no wakeup is ever lost")
 
-	// 4. Mostly asleep.
+	// 3. Mostly asleep.
 	if RaceEnabled {
 		return
 	}
 	arms := []arm{
-		{name: "ring: a token per sleeper", make: ringCAS},
-		{name: "ring: one token, shared", make: ringWith(turnstile.Options{SharedToken: true})},
-		{name: "ring: consumers never sleep", make: ringWith(turnstile.Options{Spin: true})},
-		{name: "channel: its own parking", make: chanWith(turnstile.SendFast)},
+		{name: "ring: a token per sleeper", make: ringTicket},
+		{name: "ring: one token, shared", make: ringWith(true, turnstile.Variant{SharedToken: true})},
+		{name: "ring: consumers never sleep", make: ringWith(true, turnstile.Variant{Spin: true})},
+		{name: "channel: its own parking", make: chanWith(sendFast)},
 	}
 	fmt.Printf("\n  %d x %d, consumers spend %s per event, the queue empty most of the time; median of 3:\n",
 		Producers, Consumers, Ns(WorkNs))
@@ -147,14 +113,15 @@ func Phase3() {
 	// 5. Where the shared token's tail comes from.
 	fmt.Printf("\n  the runtime's lock-contention profile at 200 k/s, each arm a child, slowed by profiling:\n")
 	fmt.Printf("    %-28s %9s %18s %14s %14s\n", "", "push p99", "estimated waiting", "in sleeps", "in wakes")
-	for _, name := range []string{"wake-own-token", "wake-shared-token"} {
-		c, ok := contended(name)
+	for _, child := range []struct{ name, label string }{
+		{"wake-own-token", "ring: a token per sleeper"},
+		{"wake-shared-token", "ring: one token, shared"},
+	} {
+		c, ok := contended(child.name)
 		if !ok {
 			return
 		}
-		label := map[string]string{"wake-own-token": "ring: a token per sleeper",
-			"wake-shared-token": "ring: one token, shared"}[name]
-		fmt.Printf("    %-28s %9s %16.2f s %13.0f%% %13.0f%%\n", label, Ns(c.P99), c.Total,
+		fmt.Printf("    %-28s %9s %16.2f s %13.0f%% %13.0f%%\n", child.label, Ns(c.P99), c.Total,
 			100*c.Select/max(c.Total, 1e-9), 100*c.Send/max(c.Total, 1e-9))
 	}
 	fmt.Printf("    sleeps = waiting inside a sleeper's select; wakes = inside a producer's token send\n")
@@ -165,50 +132,59 @@ func lowRate() Spec {
 }
 
 func init() {
-	profiled("wake-own-token", ringCAS, lowRate)
-	profiled("wake-shared-token", ringWith(turnstile.Options{SharedToken: true}), lowRate)
+	profiled("wake-own-token", ringTicket, lowRate)
+	profiled("wake-shared-token", ringWith(true, turnstile.Variant{SharedToken: true}), lowRate)
 }
 
 const wakeTrials = 2000
 
 // asleep waits until the other goroutine has announced it is about to sleep,
-// then a further 50 µs, by which time it is parked rather than on its way.
+// then settles.
 func asleep(flag *atomic.Bool) {
 	for !flag.Load() {
 		runtime.Gosched()
 	}
+	settle()
+	flag.Store(false)
+}
+
+// settle waits 50 µs, by which time a goroutine that announced it was about to
+// sleep is parked rather than on its way.
+func settle() {
 	end := tsc.Ticks() + Clk.Ticks(50_000)
 	for tsc.Ticks() < end {
 		tsc.Pause()
 	}
-	flag.Store(false)
 }
 
-func wakeToken() (waker, sleeper Histogram) {
-	w := turnstile.NewWaiter(false)
-	var flag atomic.Bool
-	var woke, t0 atomic.Uint64
+// wakeRing times a push that finds a consumer parked in Pop on an empty ring:
+// the push itself, and until the consumer has its event.
+func wakeRing() (waker, sleeper Histogram) {
+	q := turnstile.New[ev](8)
+	var woke atomic.Uint64
 	done := make(chan struct{})
 	go func() {
-		var st turnstile.OpStats
-		for i := 0; i < wakeTrials; i++ {
-			w.Prepare(&st)
-			flag.Store(true)
-			w.Wait(time.Second, &st)
+		c := q.Consumer()
+		for range wakeTrials {
+			c.Pop()
 			woke.Store(tsc.Ticks())
 		}
 		close(done)
 	}()
-	for i := 0; i < wakeTrials; i++ {
-		asleep(&flag)
+	p := q.Producer()
+	for i := range wakeTrials {
+		for q.Sleepers() == 0 {
+			runtime.Gosched()
+		}
+		settle()
 		woke.Store(0)
-		t0.Store(tsc.Ticks())
-		w.Notify()
-		waker.Record(tsc.Ticks() - t0.Load())
+		t0 := tsc.Ticks()
+		p.TryPush(turnstile.MakeEvent(0, uint32(i), t0))
+		waker.Record(tsc.Ticks() - t0)
 		for woke.Load() == 0 {
 			runtime.Gosched()
 		}
-		sleeper.Record(woke.Load() - t0.Load())
+		sleeper.Record(woke.Load() - t0)
 	}
 	<-done
 	return
@@ -295,28 +271,30 @@ func wakeRace(bug turnstile.Bug, iterations, spread int) race {
 	var acked atomic.Int64
 	acked.Store(-1)
 	rng := rand.New(rand.NewPCG(1, uint64(spread)))
-	hooks := &turnstile.Hooks{Parking: func() {
-		parking.Add(1)
-		for n := rng.IntN(spread); n > 0; n-- {
-			tsc.Pause()
-		}
-	}}
-	q := turnstile.NewRing[ev, struct{}](8, turnstile.Options{Backstop: 2 * time.Millisecond, Hooks: hooks, Bug: bug})
+	q := turnstile.NewVariant[ev](8, turnstile.Variant{
+		Backstop: 2 * time.Millisecond,
+		Bug:      bug,
+		Hooks: turnstile.Hooks{Parking: func() {
+			parking.Add(1)
+			for n := rng.IntN(spread); n > 0; n-- {
+				tsc.Pause()
+			}
+		}},
+	})
 	oneMs := Clk.Ticks(1e6)
 	var out race
 	done := make(chan struct{})
 	go func() {
-		var st turnstile.OpStats
-		var e ev
-		forever := time.Now().Add(time.Hour)
+		c := q.Consumer()
 		for i := 0; i < iterations; i++ {
-			parks, backstops := st.Parks, st.Backstops
-			if q.Pop(&e, forever, &st) != turnstile.PopOK {
+			before := c.Stats()
+			if _, err := c.Pop(); err != nil {
 				break
 			}
 			now := tsc.Ticks()
+			after := c.Stats()
 			switch {
-			case st.Backstops > backstops:
+			case after.Backstops > before.Backstops:
 				// Slept through it: lost if the producer's push, notify and all,
 				// had returned long before the backstop fired; merely late if the
 				// producer was itself descheduled in between.
@@ -325,7 +303,7 @@ func wakeRace(bug turnstile.Bug, iterations, spread int) race {
 				} else {
 					out.late++
 				}
-			case st.Parks > parks:
+			case after.Parks > before.Parks:
 				out.woken++
 			default:
 				out.recheck++
@@ -337,7 +315,7 @@ func wakeRace(bug turnstile.Bug, iterations, spread int) race {
 		}
 		close(done)
 	}()
-	var st turnstile.OpStats
+	p := q.Producer()
 	prng := rand.New(rand.NewPCG(2, uint64(spread)))
 	var seen uint64
 	for i := 0; i < iterations; i++ {
@@ -347,7 +325,7 @@ func wakeRace(bug turnstile.Bug, iterations, spread int) race {
 		for n := prng.IntN(64); n > 0; n-- {
 			tsc.Pause()
 		}
-		q.Push(turnstile.MakeEvent(0, uint32(i), tsc.Ticks()), time.Now().Add(5*time.Second), &st)
+		p.Push(turnstile.MakeEvent(0, uint32(i), tsc.Ticks()))
 		pushedAt.Store(tsc.Ticks())
 		for acked.Load() < int64(i) {
 			runtime.Gosched()
