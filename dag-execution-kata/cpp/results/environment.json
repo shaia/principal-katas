@@ -1,0 +1,18 @@
+{
+  "base_commit": "6d17e18623b6d10c9157ab4c21689f4b1c132562",
+  "dirty_tree": true,
+  "compiler": "Clang 21.1.7 x86_64-pc-windows-msvc",
+  "cmake": "4.2.1",
+  "generator": "Ninja",
+  "preset": "release / micro",
+  "flags": "CMake Release -O3 -DNDEBUG; no explicit ISA or LTO",
+  "os": "Windows-11-10.0.26300-SP0",
+  "logical_cpus": 32,
+  "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+  "affinity": "uncontrolled on measured single-node host",
+  "benchmark_version": "v1.9.4",
+  "seed": 33,
+  "smoke_repetitions": 3,
+  "smoke_samples_per_repetition": 10000,
+  "warmup_seconds": 1
+}
