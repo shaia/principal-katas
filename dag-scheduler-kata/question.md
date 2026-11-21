@@ -2,23 +2,66 @@
 
 ## The brief
 
-A DAG engine runs tasks whose inputs are the outputs of other tasks. Each task has a counter,
-`pending_dependencies`, initialised to its number of predecessors. When a task finishes, it
-decrements the counter of each of its successors, and the predecessor whose decrement takes a
-counter to zero enqueues that successor to run. Successors read data produced by **all** of their
-predecessors.
+You're designing a C++20 parallel execution engine for an endpoint security product. Each incoming
+security event triggers a directed acyclic graph (DAG) of analysis tasks, for example:
 
-The engine decrements with `memory_order_relaxed`:
+```text
+                 Process Event
+                      |
+             +--------+--------+
+             |                 |
+        Inspect File      Inspect Network
+             |                 |
+             +--------+--------+
+                      |
+                Correlate Data
+                      |
+                 Apply Policy
+                      |
+                 Emit Result
+```
+
+Requirements:
+
+- Up to 1 million active tasks.
+- 64 worker threads.
+- Tasks have between 0 and 8 dependencies.
+- A task must not execute before all its predecessors finish.
+- Results produced by predecessors must be visible to dependent tasks.
+- No global scheduler lock.
+- Minimize task-scheduling overhead.
+- p99 event-processing latency below 5 ms.
+
+A developer implements:
 
 ```cpp
-void on_finished(Task& t) {
-    for (Task* s : t.successors)
-        if (s->pending_dependencies.fetch_sub(1, std::memory_order_relaxed) == 1)
-            ready_queue.push(s);
+struct Task {
+    std::atomic<uint32_t> pending_dependencies;
+    std::vector<Task*> successors;
+    std::function<void()> execute;
+};
+
+void complete(Task& task, ReadyQueue& ready)
+{
+    for (Task* next : task.successors) {
+        if (next->pending_dependencies.fetch_sub(
+                1, std::memory_order_relaxed) == 1) {
+            ready.push(next);
+        }
+    }
 }
 ```
 
-Is relaxed ordering correct? Design the scheduler and its memory-ordering contract.
+Assume `ReadyQueue` is a correctly synchronized concurrent queue.
+
+The developer argues:
+
+> The atomic counter guarantees that the dependent task executes only after all predecessors
+> complete. Therefore, the implementation is correct.
+
+Is the implementation correct under the C++20 memory model? Explain the difference between dependency
+completion and memory visibility. Then design an execution architecture that minimizes scheduling
+overhead while preserving correctness.
 
 Underneath it is one question:
 
@@ -26,6 +69,11 @@ Underneath it is one question:
 
 The follow-up comes after step 10, and it is a different kind of question: going from 16 to 64 workers
 raises throughput but worsens p99 from 4 ms to 18 ms while steal attempts explode.
+
+Two clauses of the brief deserve suspicion before any design. The developer's "after all predecessors
+complete" uses *after* in the wall-clock sense and *complete* for a predecessor that is still walking
+its successor list. And the requirements are numbers: check that they can all be true at once (step 5
+asks you to).
 
 ## About the framing
 
@@ -40,9 +88,10 @@ If C++ is not your language, read the brief as:
 
 | the brief | Go | Python |
 |---|---|---|
-| `std::atomic<int>` with `fetch_sub(…, relaxed)` | `atomic.Int32` with `Add(-1)`, which has no weaker form | `self.pending -= 1` under a lock, or not |
+| `std::atomic<uint32_t>` with `fetch_sub(…, relaxed)` | `atomic.Int32` with `Add(-1)`, which has no weaker form | `self.pending -= 1` under a lock, or not |
 | the predecessor's output, a plain field | a plain field | an attribute holding a reference |
-| `ready_queue.push(s)` | a channel send, or `go run(s)` | `executor.submit(run, s)` |
+| `ready.push(next)` | a channel send, or `go run(next)` | `executor.submit(run, next)` |
+| `std::function<void()> execute` | a `func()` field | a callable attribute |
 | a worker thread | a goroutine, multiplexed onto `GOMAXPROCS` OS threads | a thread holding the interpreter lock, or a process |
 
 The table is for orientation only. Each track covers what its language charges for these operations,
@@ -269,6 +318,12 @@ A task that does 100 ns of work in a scheduler that spends 200 ns on it is a sch
 - a join with 4,096 predecessors: what one counter costs when they all finish at once, and the
   alternative
 - the edge that needs no read-modify-write, and how much of a typical graph is made of them
+- the developer's `Task`: what one `std::vector` and one `std::function` per task cost at a million
+  tasks, and which cache line the counter shares with fields the running worker reads
+- whether the requirements can all hold at once. A million *ready* tasks of 450 ns on 64 workers take
+  how long to drain, against a 5 ms p99? At the follow-up's 1.4 M tasks/s, what does Little's law say
+  a million tasks in flight means for the time each spends there? So what must "active" mean, and
+  which number does the design actually need?
 
 <details>
 <summary>Hint</summary>
@@ -302,6 +357,10 @@ scheduler that runs the wrong ready task first can stretch it.
   wait, and behind what
 - how much of the latency at 50 %, 80 % and 95 % load is the scheduler's choice, and how much is
   queueing that no ordering removes
+- the outline's example: 10,000 tasks of 1 µs with a 2,000-task chain. Its lower bound is
+  max(W/P, L). What is its upper bound for a scheduler that never idles a worker while work is ready,
+  how many workers can the graph keep busy at all, and how much overhead may each hop of the chain
+  add before the 5 ms target is gone? Which costs fit in that, and which do not?
 
 <details>
 <summary>Hint</summary>
@@ -334,6 +393,9 @@ A task throws. Another graph's deadline expires. The process is shutting down.
 - why cancellation latency is bounded below by the longest task body, and what that says about task
   granularity
 - how the failure travels to the successor with the same visibility guarantee as a payload
+- the terminal states a task can end in, and which of them a successor may read inputs from. Is "my
+  predecessor failed" the same outcome as "the run was canceled before I started", and does the
+  caller need to tell them apart?
 
 <details>
 <summary>Hint</summary>
@@ -434,11 +496,32 @@ stealing if there are always more events than cores.
 
 ## The follow-up
 
-Going from 16 to 64 workers raises throughput but worsens p99 from 4 ms to 18 ms, while steal
-attempts explode. Explain stealing amplification, and redesign around task granularity, NUMA,
-priority, and worker budgets.
+Your work-stealing scheduler produces these results:
+
+| metric | 16 workers | 64 workers |
+|---|---:|---:|
+| throughput | 850K tasks/s | 1.4M tasks/s |
+| CPU utilization | 88 % | 42 % |
+| p50 event latency | 1.2 ms | 900 µs |
+| p99 event latency | 4 ms | 18 ms |
+| steal attempts/s | 200K | 9M |
+| average task duration | 450 ns | 450 ns |
+
+The scheduler achieves higher aggregate throughput, yet p99 latency becomes substantially worse.
+Explain why increasing the worker count causes this, and redesign the scheduler to improve tail
+latency: task granularity, stealing amplification, cache-line contention, critical-path scheduling,
+worker oversubscription, and NUMA-aware placement. Should tasks on an event's critical path be treated
+differently from independent background tasks?
+
+The table is the session's hypothetical, not a measurement. Read it as evidence that may not be
+consistent, and do not claim it identifies one cause.
 
 **Be prepared to say:**
+
+- whether the table adds up. How many cores of task work does each column contain (tasks/s × task
+  duration), against how many cores busy? What is the rest? What does utilization *falling* while
+  steal attempts rise 45× say about whether the thieves are spinning or asleep?
+- why p50 can improve while p99 gets worse: which events got faster, and which slower
 
 - why steal attempts grow faster than workers — count the attempts an idle worker makes per second,
   and the number of idle workers, as a function of the worker count
@@ -450,6 +533,9 @@ priority, and worker budgets.
   the role on — and which production runtime already works this way
 - what NUMA changes: whom to steal from first, where a graph's memory was allocated, and whether a
   graph should ever cross sockets
+- what changes if the 64 workers run on fewer logical CPUs than 64, or on SMT siblings: which
+  effects are oversubscription, which are SMT, which are cache movement, and which are NUMA, and a
+  controlled experiment that separates each
 - what you would measure first, on the 64-core machine, before changing anything
 
 <details>
@@ -473,11 +559,17 @@ changes with the measurement that would confirm each.
 
 This is the rubric the question was asked against.
 
-- **Senior** — understands dependency counts. → steps 0, 3
-- **Strong Senior** — identifies the missing publication of predecessor writes. → steps 0, 1, 2
-- **Staff** — uses correct synchronization and work-stealing queues. → steps 2, 4, 8
-- **Principal** — reasons about critical path, task size, NUMA, priority, and cancellation and failure
-  propagation. → steps 5, 6, 7, 9, the follow-up
+- **Senior** — understands DAG scheduling, atomic dependency counters, and why only the last
+  predecessor schedules a task. → steps 0, 3
+- **Strong Senior** — identifies that relaxed atomic operations do not establish the required
+  happens-before relationships. → steps 0, 1, 2
+- **Staff** — designs correct acquire/release synchronization, efficient ready queues, and
+  work-stealing execution. → steps 2, 4, 8
+- **Principal** — analyzes critical-path limits, task granularity, memory locality, load balancing,
+  cancellation, and scheduling progress guarantees. → steps 5, 6, 7, 9, the follow-up
+
+Its critical distinction: an atomic dependency counter establishes a scheduling condition, but relaxed
+operations do not necessarily publish the data produced by predecessor tasks.
 
 The asked rubric stops there. This kata adds:
 

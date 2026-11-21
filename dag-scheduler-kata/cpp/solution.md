@@ -16,21 +16,32 @@ back to back. Terms of art (TSO, LSE, release sequence, Brent's bound, …) are 
 
 ## The problem
 
-A DAG engine gives each task a counter of unfinished predecessors. A finishing task decrements each
-successor's counter, and the predecessor that takes a counter to zero enqueues that successor.
-Successors read data produced by *all* their predecessors. The engine decrements with
-`memory_order_relaxed`:
+An endpoint security product turns each event into a DAG of analysis tasks. The requirements: up to
+1 million active tasks, 64 worker threads, 0–8 dependencies per task, no task before all its
+predecessors finish, predecessors' results visible to dependents, no global scheduler lock, minimal
+scheduling overhead, and p99 event latency under 5 ms. A developer writes:
 
 ```cpp
-void on_finished(Task& t) {
-    for (Task* s : t.successors)
-        if (s->pending_dependencies.fetch_sub(1, std::memory_order_relaxed) == 1)
-            ready_queue.push(s);
+struct Task {
+    std::atomic<uint32_t> pending_dependencies;
+    std::vector<Task*> successors;
+    std::function<void()> execute;
+};
+
+void complete(Task& task, ReadyQueue& ready)
+{
+    for (Task* next : task.successors)
+        if (next->pending_dependencies.fetch_sub(1, std::memory_order_relaxed) == 1)
+            ready.push(next);
 }
 ```
 
-Is relaxed correct? Design the scheduler and its memory-ordering contract. The follow-up: going from
-16 to 64 workers raises throughput but worsens p99 from 4 ms to 18 ms while steal attempts explode.
+`ReadyQueue` is assumed correctly synchronized. The developer argues that the atomic counter
+guarantees the dependent runs only after all predecessors complete, so the code is correct. Is it,
+under the C++20 memory model? Explain dependency completion against memory visibility, and design an
+architecture that minimizes scheduling overhead while preserving correctness. The follow-up: going
+from 16 to 64 workers raises throughput but worsens p99 from 4 ms to 18 ms while steal attempts
+explode. The full text is in [../reference-outline.md](../reference-outline.md).
 
 ### What the brief gives you, and what it withholds
 
@@ -39,17 +50,22 @@ Is relaxed correct? Design the scheduler and its memory-ordering contract. The f
 | the last predecessor enqueues the successor | exactly one thread owns the successor, and the counter's atomicity alone guarantees that, under any ordering (§3) |
 | successors read data from **all** predecessors | every predecessor must publish, and the last one must acquire. The relaxed decrement does neither (§2) |
 | `memory_order_relaxed` | on x86-64 the same instruction as the correct version, so the bug is invisible to every test on that hardware (§2, §8) |
-| "design the scheduler" | a second publication hop through the ready queue, which the brief assumes and a textbook work-stealing deque does not provide (§5) |
+| "Assume `ReadyQueue` is a correctly synchronized concurrent queue" | a second publication hop, which the brief assumes, and which stops being an assumption once "design the architecture" replaces the queue with per-worker deques. A textbook work-stealing deque does not provide it (§5) |
+| "the dependent task executes only after all predecessors complete" | two words to dispute. *After* is wall-clock, not happens-before (§2). *Complete* is wrong too: the decrement happens partway through `complete()`, while the predecessor is still walking its successor list, which is the lifetime race (§4) |
+| `std::vector` and `std::function` per task | an allocation per task at a million tasks, and a counter on the same cache line as fields the running worker reads. The executor splits an immutable shape from per-run state and pads each counter to a line (§4) |
 | — | **no statement about when a graph may be freed or reused**, though a predecessor can still be running after the graph it belongs to has finished (§4) |
+| 1 M active tasks, 64 workers, p99 < 5 ms | numbers that cannot all describe *ready* tasks. A million ready 450 ns tasks take 1 M × 450 ns / 64 ≈ 7 ms to drain on 64 workers. By Little's law, a million tasks in flight at the follow-up's 1.4 M tasks/s spend about 0.7 s each. So "active" must mean mostly waiting, and the number a design needs, how many are ready at once, is the one the brief does not give |
 | 16 → 64 workers, p99 4 → 18 ms | a machine with more cores than this one, and probably two sockets. §10 reproduces the amplification and not the 18 ms, and says why |
 
 ### How the answer is graded
 
-- **Senior**: dependency counts. → §3, §4
-- **Strong Senior**: the missing publication of predecessor writes. → §2, §3
-- **Staff**: correct synchronization and work-stealing queues. → §3, §5, §8
-- **Principal**: critical path, task size, NUMA, priority, cancellation and failure propagation.
-  → §6, §7, §9, §10
+- **Senior**: DAG scheduling, atomic dependency counters, and why only the last predecessor
+  schedules a task. → §3, §4
+- **Strong Senior**: relaxed operations do not establish the required happens-before. → §2, §3
+- **Staff**: correct acquire/release synchronization, efficient ready queues, work stealing.
+  → §3, §5, §8
+- **Principal**: critical-path limits, task granularity, memory locality, load balancing,
+  cancellation, and scheduling progress guarantees. → §6, §7, §9, §10
 - And the line the kata adds: **when not to steal at all.** → §1
 
 ### Where each part is answered
@@ -395,6 +411,15 @@ matters when no thief is idle and CP is comparable to W/P. On 4 workers (the thi
 W/P is 612 µs, more than CP, so the event is bound by work, and all four arms gave the same p50 within
 a bucket.
 
+**The outline's own example says the same, once the bound is closed.** 10,000 tasks of 1 µs with a
+2,000-task chain: W = 10 ms, CP = 2 ms, and on 64 workers W/P = 156 µs. The outline stops at the lower
+bound, 2 ms. The upper bound is W/P + CP ≈ 2.16 ms, within 8 % of it, so no ordering can win much
+there either. And W/CP = 5: the graph keeps about five workers busy, and the other 59 can only look
+for work. Against the 5 ms target, each of the 2,000 hops on the chain may add (5 − 2) ms / 2,000 =
+1.5 µs. §6's deque round trip fits in that many times over. A park and wake on the chain does not: at
+phase 0's 10.6 µs median wake, 2,000 hops would cost about 21 ms. That is arithmetic, not a
+measurement, but it puts the follow-up's 18 ms within reach of sleeping alone (§10).
+
 **Starvation**, the outline's risk for critical-path priority, did not show either. Rank arms had no
 systematically worse maximum. It would need a steady supply of high-rank work that keeps low-rank
 tasks waiting, and with inline continuation the high-rank work is one chain per event, run by one
@@ -510,6 +535,16 @@ because cancellation is checked between tasks, never inside one. Cancellation la
 by task size, which is one more reason for the grain §6 recommends. Which policy is right is a product
 question: poison keeps the partial results, and fail-fast frees the workers.
 
+This is the outline's extension, "separate task completion accounting from successful result
+publication", made concrete. The counter accounts for completion and is decremented by every
+predecessor whatever happened to it. The poison flag, stored before the same release decrement, says
+whether the inputs are usable. A node here ends in one of three states: ran, failed, or skipped. A
+finer split is worth having when the caller must report *why* a node did not run: *skipped* because a
+predecessor did not succeed, against *canceled* because the run was canceled before the node was
+dispatched. It costs nothing extra, because the state is written before the release decrement like
+the flag. Neither split lets a canceled body be interrupted. A body that is already running finishes,
+and may succeed after the cancel.
+
 Every failed instance in phase 2 and phase 5 was checked against its expected run set. Under poison,
 a body ran exactly when nothing upstream had failed. Under fail-fast, it never ran when something
 upstream had.
@@ -520,6 +555,30 @@ upstream had.
 
 > Going from 16 to 64 workers raises throughput but worsens p99 from 4 ms to 18 ms while steal
 > attempts explode.
+
+### Whether the table adds up
+
+The session gives the follow-up as a table, and the table is hypothetical. Before explaining it, it is
+worth checking, using nothing but its own numbers:
+
+| | 16 workers | 64 workers |
+|---|---:|---:|
+| cores busy (utilization × workers) | 14.1 | 26.9 |
+| cores of task work (tasks/s × 450 ns) | 0.38 | 0.63 |
+| task work as a share of busy CPU | 2.7 % | 2.3 % |
+| steal attempts per worker per second | 12.5 K | 141 K |
+
+Three things follow. First, task bodies are under 3 % of the CPU in *both* columns, so the
+scheduler, or something the table does not name, was 97 % of the cost before any thief was added.
+Second, steal attempts rise 45× for 4× the workers, while utilization *falls* from 88 % to 42 %: the
+extra thieves spend most of their time asleep, not spinning. That points at the park and wake cost
+§7 priced, rather than at spinning thieves. Third, p50 improves while p99 gets worse. That is a split
+population: events that stay on one worker got faster, and events whose critical path crosses a wake
+or a remote steal got much slower.
+
+This machine runs a different regime. Below, 64 greedy workers spent 20.7 cores on 11.9 cores of
+work, 57 % useful against the table's 2–3 %. What reproduces here is the amplification and the cost
+of sleeping. The table's ratios do not.
 
 ### What a thief costs the work it steals from
 
@@ -635,23 +694,29 @@ the second shows it. If it is thieves taxing owners, the first and third do.
 
 ## 11. The reference outline, checked
 
-The question came with an outline ([../reference-outline.md](../reference-outline.md)). Claim by
-claim:
+The question came with an outline, Session 33's sections 3–7
+([../reference-outline.md](../reference-outline.md)). Claim by claim:
 
 | the outline says | measured here |
 |---|---|
-| "The last predecessor must acquire the effects of earlier predecessors before publishing the successor." | Right, and the earlier predecessors must also release. The outline's next sentence covers both (§3). |
-| "An acq_rel RMW chain on the dependency counter can establish that relation" | Right. Release on every decrement plus one acquire by the last is enough, and cheaper on AArch64. All of them are free on x86 (§2, §3). |
-| "assuming every predecessor decrements exactly once" | Right, and it is the assumption a failure path breaks. Resolving twice hangs (§8), so failure has to resolve every edge exactly once (§9). |
-| "and the ready queue correctly transfers publication" | The assumption a textbook Chase–Lev deque does not meet: its thief reads the slot `relaxed`. The relaxed-publish row in §8 is that gap, and TSan reports it. |
-| "tiny tasks may need fusion or inline continuation" | Both measured. Inline continuation: 14 ns per hop against 76–93 ns. Fusion: 56 % → 94 % efficiency at 1 µs tasks, and too much of it costs balance (§6). |
-| tradeoff: "critical-path priority: lower event latency, starvation risk" | Neither showed here. Brent's bound left 27 µs to win, FIFO stealing already wins most of it, and nothing starved (§7). |
-| tradeoff: "work stealing: good utilization, potential cache/NUMA damage" | The cache damage is §10's nearly 5× per hop with idle thieves. The NUMA damage cannot be measured on one socket. |
-| follow-up: "redesign around task granularity, NUMA, priority, and worker budgets" | Granularity and a small budget, measured; NUMA, reasoned; priority, measured to matter little (§10). |
+| "the relaxed decrement by A does not establish a happens-before relationship between A's write and C's read", so C's read "can constitute a data race … even if the implementation happens to work on a particular x86-64 system" | Right, and stronger than "happens to work". On x86-64, relaxed and acq_rel compile to the same `lock dec`, so no test on that hardware can tell them apart: two million cross-core joins per ordering, 0 bad inputs. Only ThreadSanitizer reported it (§2, §8). |
+| "The ready queue can publish B's preceding writes because B enqueues C. It does not automatically publish unrelated writes performed by A." | Right. That is the brief's bug in two sentences (§2). |
+| `fetch_sub(acq_rel)`, because "the acquire/release relationships establish transitive synchronization" | Right as stated, and more than is needed. Through release sequences, release on every decrement plus one acquire by the last predecessor is enough, which is cheaper on AArch64 and the same on x86 (§2, §3). The executor spells the acquire as a load, so that TSan can vouch for it (§8). |
+| invariants: the graph fully initialized before execution, each predecessor decrements exactly once, result storage stays alive, predecessors stop modifying what successors read | Right, and one short. "Result storage" covers the payloads. It does not cover the successor list the completing predecessor is still walking after its last decrement, which is the lifetime race (§4). "Exactly once" is the assumption a failure path breaks: resolving twice hangs (§8), so failure resolves every edge once (§9). |
+| "assuming the queue provides the necessary release/acquire handoff"; the deque's protocol "must be proven separately" | Right, and the warning is earned. The textbook C11 Chase–Lev thief reads the slot `relaxed`, and the owner's pop stores `bottom` relaxed, so a thief can take a task without synchronizing with its push. The relaxed-publish row in §8 is that gap, and TSan reports it (§5). |
+| "Correct memory ordering is part of the scheduler's API contract" | Agreed. The contract (§3) is stated so that task bodies read and write plain fields. |
+| stealing costs: cross-core transfers, NUMA, contention among stealers, reclamation, fairness | Cross-core cost measured: idle thieves made the owner's hop nearly 5× slower (§10). Reclamation is avoided by a bounded deque that runs overflow inline (§5). NUMA cannot be measured on one socket. |
+| T_P ≥ max(W/P, L); 10,000 × 1 µs with a 2,000-task chain cannot beat 2 ms | Right, and it stops at the half that matters less. The upper bound W/P + L ≈ 2.16 ms is within 8 % of it, and W/L = 5 workers' worth of parallelism (§7). On the fork graph, Brent's bound left 27 µs for priority to win. |
+| small tasks cost atomics and queue traffic; at 100 ns a stage, "enqueueing and dequeuing … may cost more than the work itself" | Measured: a deque round trip is 76–93 ns against 14 ns inline, so a 100 ns stage pays about as much again to cross the queue. Fusing 1 µs tasks 8 to 1 takes efficiency from 56 % to 94 % (§6). |
+| work-first execution: "fairness and stack-depth concerns" | Inline continuation is a loop, not a call, so it adds no depth. Only a push to a full deque runs its task recursively, so the deque's size bounds the depth (§5). |
+| priority scheduling: "better latency for critical tasks", "starvation" | Neither showed here. FIFO stealing already wins most of it, and nothing starved (§7). |
+| the follow-up table | Its own numbers do not add up: task bodies are under 3 % of busy CPU in both columns, and utilization falls while steals rise 45× (§10). The amplification reproduces here. The 18 ms does not, on one socket. |
+| the extension: explicit terminal states, failure propagated through the graph, "task completion accounting" separate from "successful result publication" | That is §9's design: the counter accounts for completion, and a poison flag released with the same decrement says whether the result is usable. |
 
-What the outline does not mention: the payload's lifetime (§4), the ThreadSanitizer false positive on
-the fence spelling (§8), the cost of *sleeping* thieves, which here was worse than spinning ones
-(§10), and the fact that on x86 nothing but a race detector can tell the brief's code from the fix.
+What the outline does not mention: that the brief's requirements cannot all describe ready tasks (the
+problem table), the ThreadSanitizer false positive on the fence spelling (§8), the cost of *sleeping*
+thieves, which here was worse than spinning ones (§10), and that on x86 nothing but a race detector
+can tell the brief's code from the fix.
 
 ---
 
