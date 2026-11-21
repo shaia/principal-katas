@@ -46,6 +46,16 @@ int finish_acq_rel(struct node* me, struct node* succ, u64 v) {
     return __atomic_fetch_sub(&succ->pending, 1, __ATOMIC_ACQ_REL) == 1;
 }
 
+/* Two stores to the output around a relaxed decrement. Under the C++ model no
+ * other thread can read the first one without a race, so the first store is
+ * dead and a compiler may delete it; whether this one does is the question. */
+int finish_relaxed_twice(struct node* me, struct node* succ, u64 v) {
+    me->out = v;
+    int last = __atomic_fetch_sub(&succ->pending, 1, __ATOMIC_RELAXED) == 1;
+    me->out = v + 1;
+    return last;
+}
+
 /* --- the last predecessor reading another's payload ------------------------ */
 
 u64 join_relaxed(struct node* other, struct node* succ) {
