@@ -37,7 +37,7 @@ the runtime has already decided for you.
 
 | | thesis |
 |---|---|
-| [**cpp/solution.md**](cpp/solution.md) | Relaxed is wrong, and on x86-64 nothing but a race detector can tell: every spelling of the decrement compiles to the same `lock dec`. The contract is release on every decrement plus one acquire by the last predecessor, spelled as an acquire *load* of the counter so that ThreadSanitizer can vouch for it, plus a work-stealing deque that publishes rather than merely queues, and a graph whose shared part is immutable so a predecessor may still read it after the run has ended. Then the scheduler: inline continuation (14 ns a hop against 76–93 ns through the deque), fusion to a few microseconds a task, rank priority that Brent's bound left almost nothing to win, and failure that still resolves every edge once. The follow-up's amplification reproduces (thieves made the owner's hop nearly 5× slower; 1.58 × 10⁸ steal attempts/s, 98 % failing). Its 18 ms does not, on one socket. What hurt the tail here was sleeping, and a small search budget works only after fusion. |
+| [**cpp/solution.md**](cpp/solution.md) | Relaxed is wrong, and on x86-64 nothing but a race detector can tell: every spelling of the decrement compiles to the same `lock dec`. The contract is release on every decrement plus one acquire by the last predecessor, spelled as an acquire *load* of the counter so that ThreadSanitizer can vouch for it, plus a work-stealing deque that publishes rather than merely queues, and a graph whose shared part is immutable so a predecessor may still read it after the run has ended. Then the scheduler: inline continuation (14 ns a hop against 76–93 ns through the deque), fusion to a few microseconds a task, rank priority that Brent's bound left almost nothing to win, and failure that still resolves every edge once. The follow-up's amplification reproduces (thieves made the owner's hop four to six times slower; 1.61 × 10⁸ steal attempts/s, 98 % failing). So, intermittently, does its symptom: near saturation, 64 greedy workers on 24 CPUs had p99 up to 43 ms in half of eight runs, where 24 never passed 1.5 ms. Sleeping hurt the tail in every run, and a small search budget works only after fusion. Tail claims come from eight runs, because one run can rank the arms either way. |
 | go/solution.md | not written — [go/question.md](go/question.md) |
 | python/solution.md | not written — [python/question.md](python/question.md) |
 
@@ -67,14 +67,23 @@ the runtime has already decided for you.
 - **Fail-fast reports a failure in 40 µs, poison in 284 µs**, and fail-fast's floor is the longest
   body still running, because cancellation acts between tasks.
   ([cpp §9](cpp/solution.md#9-failure-and-cancellation))
-- **Sixteen idle thieves made their victim's hop nearly five times slower** with nothing to steal,
-  and 64 greedy workers spent 20.7 cores doing 11.9 cores of work.
+- **Sixteen idle thieves made their victim's hop four to six times slower** with nothing to steal,
+  and 64 greedy workers spent 21.0 cores doing 11.9 cores of work.
   ([cpp §10](cpp/solution.md#10-the-follow-up-stealing-amplification))
-- **A search budget of four without fusion was the worst arm measured, at 68.3 ms p99.** With tasks
-  fused 8 to 1 the same budget matched the greedy tail at two thirds of the CPU. Granularity first,
-  budget second. And the textbook budget, half the workers, had the worst p99.9 of the rest, at
-  14.2 ms, because it sleeps and wakes constantly.
+- **More workers, the same median, a tail tens of times worse, on one socket.** At 20,000 events/s,
+  18.2 cores of work on 24 CPUs, 64 greedy workers had p99 from 516 µs to 43.2 ms across eight runs,
+  above 5 ms in four. 24 greedy workers stayed under 1.5 ms in all eight, and fusing tasks 8 to 1 kept
+  64 workers under 1 ms. The likely cause, workers descheduled mid-task by oversubscription, is a
+  hypothesis, and §10 names the check.
+  ([cpp §10](cpp/solution.md#under-load))
+- **A search budget of four without fusion was the worst arm in six of eight runs**, at p99 2.3–82 ms.
+  With tasks fused 8 to 1, the same budget came within a bucket or two of the greedy tail at under
+  two thirds of the CPU. Granularity first, budget second. The textbook budget, half the workers, had
+  p99 above 2 ms in every run at 64 workers, because it sleeps and wakes constantly.
   ([cpp §10](cpp/solution.md#the-redesign))
+- **One run was not enough to rank tails.** At 90 % load every critical-path arm had at least one run
+  with p99 above 10 ms, and the "worst" arm changed between runs. Medians reproduced to the bucket.
+  ([cpp §7](cpp/solution.md#7-the-critical-path-and-how-much-priority-can-win))
 
 ## Verify
 
