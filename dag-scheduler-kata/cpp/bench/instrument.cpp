@@ -204,14 +204,35 @@ void phase_instrument(const Context& ctx) {
                 1.0 / ctx.clk.ns_per_tick());
 
     if (ctx.efficiency.empty()) {
-        std::printf("  CPUs           %d logical; the OS does not say which kind (WSL hides it)\n", logical_cpus());
+        std::printf("  CPUs           %d logical; the OS does not say which kind (Linux and WSL do not)\n", logical_cpus());
     } else {
         int fast = 0;
         for (int c : ctx.efficiency) fast += c == ctx.efficiency[static_cast<std::size_t>(ctx.fast_cpu)];
         std::printf("  CPUs           %d logical: %d of the fastest class (e.g. CPU %d), %d slower (e.g. CPU %d)\n",
                     logical_cpus(), fast, ctx.fast_cpu, logical_cpus() - fast, ctx.slow_cpu);
     }
-    std::printf("  NUMA           one node: every cross-socket claim in the solution is reasoning, not measurement\n");
+    const auto nodes   = cpu_numa_nodes();
+    const int  n_nodes = nodes.empty() ? 0 : *std::max_element(nodes.begin(), nodes.end()) + 1;
+    // A CPU on another node than the fast one, if there is another node.
+    int remote = -1;
+    for (int c = 0; c < static_cast<int>(nodes.size()); ++c)
+        if (nodes[static_cast<std::size_t>(c)] != nodes[static_cast<std::size_t>(ctx.fast_cpu)]) {
+            remote = c;
+            break;
+        }
+    if (n_nodes == 0)
+        std::printf("  NUMA           the OS does not say: treat every cross-socket claim as reasoning\n");
+    else if (remote < 0)
+        std::printf("  NUMA           one node: every cross-socket claim in the solution is reasoning, not measurement\n");
+    else {
+        std::printf("  NUMA           %d nodes; CPU %d is on node %d, CPU %d on node %d\n", n_nodes, ctx.fast_cpu,
+                    nodes[static_cast<std::size_t>(ctx.fast_cpu)], remote, nodes[static_cast<std::size_t>(remote)]);
+        const auto pr = ping_pong(ctx, ctx.fast_cpu, remote);
+        std::printf("  TSC skew       CPU %d vs CPU %d (other node): %+.1f ns\n", ctx.fast_cpu, remote, pr.skew_ns);
+        check(pr.skew_ns > -100 && pr.skew_ns < 100, "TSC skew across nodes under 100 ns");
+        std::printf("  line transfer  one way, CPU %d -> CPU %d on the other node: %s\n", ctx.fast_cpu, remote,
+                    fmt_ns(pr.one_way_ns).c_str());
+    }
 
     // Another core of the fastest class: CPU numbering does not say which are
     // which on a hybrid part, so look it up rather than assume a neighbour.

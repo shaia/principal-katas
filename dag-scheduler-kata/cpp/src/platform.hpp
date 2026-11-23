@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <thread>
 #include <vector>
 
@@ -97,10 +98,15 @@ private:
 };
 
 // Busy work that is not a spin-wait: the body of a task. No PAUSE, because this is meant to occupy the core.
-inline void burn(std::uint64_t ticks) noexcept {
-    const std::uint64_t until = TscClock::now() + ticks;
-    while (TscClock::now() < until) {}
+// Returns the clock when it stopped. The body runs to a deadline, not a count, so a thread the OS
+// takes off its CPU mid-body returns late: anything past start + ticks is time spent not running.
+inline std::uint64_t burn_from(std::uint64_t start, std::uint64_t ticks) noexcept {
+    const std::uint64_t until = start + ticks;
+    std::uint64_t       t;
+    while ((t = TscClock::now()) < until) {}
+    return t;
 }
+inline void burn(std::uint64_t ticks) noexcept { (void)burn_from(TscClock::now(), ticks); }
 
 // ------------------------------------------------------------------ waiting
 
@@ -212,6 +218,52 @@ inline std::vector<int> cpu_efficiency_classes() {
                 out[static_cast<std::size_t>(cpu)] = p->Processor.EfficiencyClass;
         off += p->Size;
     }
+#endif
+    return out;
+}
+
+// The NUMA node of each logical CPU, or empty where the OS does not say. On a
+// two-socket machine this is the socket, which is what the follow-up's
+// cross-socket reasoning needs measured rather than assumed.
+inline std::vector<int> cpu_numa_nodes() {
+    std::vector<int> out;
+    const int        n = logical_cpus();
+#if defined(_WIN32)
+    out.assign(static_cast<std::size_t>(n), 0);
+    for (int cpu = 0; cpu < n && cpu < 64; ++cpu) {
+        PROCESSOR_NUMBER p{};
+        p.Number    = static_cast<BYTE>(cpu);
+        USHORT node = 0;
+        if (!::GetNumaProcessorNodeEx(&p, &node) || node == 0xffff) return {};
+        out[static_cast<std::size_t>(cpu)] = node;
+    }
+#elif defined(__linux__)
+    out.assign(static_cast<std::size_t>(n), -1);
+    for (int node = 0; node < 1024; ++node) {
+        char path[96];
+        std::snprintf(path, sizeof path, "/sys/devices/system/node/node%d/cpulist", node);
+        std::FILE* f = std::fopen(path, "r");
+        if (!f) {
+            if (node == 0) return {};
+            break;
+        }
+        // "0-31,64-95": ranges and single CPUs, comma separated.
+        int a = 0, b = 0;
+        char sep = 0;
+        while (std::fscanf(f, "%d", &a) == 1) {
+            b = a;
+            if (std::fscanf(f, "%c", &sep) == 1 && sep == '-') {
+                if (std::fscanf(f, "%d", &b) != 1) break;
+                if (std::fscanf(f, "%c", &sep) != 1) sep = 0;
+            }
+            for (int c = a; c <= b; ++c)
+                if (c >= 0 && c < n) out[static_cast<std::size_t>(c)] = node;
+            if (sep != ',') break;
+        }
+        std::fclose(f);
+    }
+    for (int v : out)
+        if (v < 0) return {};  // online CPUs not numbered 0..n-1: say nothing rather than guess
 #endif
     return out;
 }

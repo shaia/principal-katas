@@ -186,6 +186,13 @@ struct Instance {
     std::atomic<bool>          cancelled{false};      // fail-fast: set by the first failure
     std::atomic<std::uint64_t> failed_at_tsc{0};
     std::uint32_t              pool_slot = 0;
+    // Stall tracing (Config::stall_ticks), for attributing tail latency. When a
+    // worker took the source from the injection queue: plain, written once by
+    // that worker, read by whoever completes the sink, and the sink descends from
+    // the source. And how long this instance's bodies spent off their CPUs.
+    std::uint64_t              injected_tsc = 0;
+    std::uint64_t              submitted_tsc = 0;  // when submit() queued it: written under the injection lock
+    std::atomic<std::uint64_t> stalled_ticks{0};
 
     explicit Instance(const Shape& s) : shape(&s), nodes(s.n), expect(s.n, 0) {
         for (std::uint32_t i = 0; i < s.n; ++i) {
@@ -203,6 +210,9 @@ struct Instance {
         verify    = check;
         cancelled.store(false, std::memory_order_relaxed);
         failed_at_tsc.store(0, std::memory_order_relaxed);
+        injected_tsc  = 0;
+        submitted_tsc = 0;
+        stalled_ticks.store(0, std::memory_order_relaxed);
         for (std::uint32_t i = 0; i < shape->n; ++i) {
             auto& nd = nodes[i];
             nd.pending.store(shape->in_degree(i), std::memory_order_relaxed);

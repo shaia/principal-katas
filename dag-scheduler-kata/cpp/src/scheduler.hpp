@@ -130,6 +130,12 @@ struct Config {
     // Deliberate bugs for the C++ track's tool table.
     bool relaxed_publish = false;  // the deque's push publishes nothing
     bool double_resolve  = false;  // a failed node resolves its out-edges twice
+    // Stall tracing, off when zero. A body that overran its deadline by more
+    // than stall_ticks was off its CPU; an instance slower than slow_ticks is
+    // attributed to such stalls, to late injection (more than slow_ticks / 2
+    // between due and taken), or to neither. In TSC ticks.
+    std::uint64_t stall_ticks = 0;
+    std::uint64_t slow_ticks  = 0;
 };
 
 struct alignas(kCacheLine) Stats {
@@ -144,6 +150,15 @@ struct alignas(kCacheLine) Stats {
     std::uint64_t busy_ticks = 0;
     Histogram     latency;          // completion - due, in TSC ticks
     Histogram     fail_to_done;     // completion - first failure, in TSC ticks
+    // Stall tracing (Config::stall_ticks).
+    std::uint64_t stalls = 0;        // bodies that overran their deadline by more than stall_ticks
+    std::uint64_t slow = 0;          // instances slower than slow_ticks, of which:
+    std::uint64_t slow_stalled = 0;  //   a body of theirs was off its CPU
+    std::uint64_t slow_late = 0;     //   they were taken from the injection queue late
+    std::uint64_t slow_late_submit = 0;  //     ... because the submitter queued them late
+    std::uint64_t slow_neither = 0;  //   neither
+    Histogram     latency_clean;     // latency of instances none of whose bodies stalled
+    Histogram     inject_delay;      // taken from the injection queue - due
 
     void merge(const Stats& o) {
         tasks += o.tasks, skipped += o.skipped, inline_runs += o.inline_runs, pushes += o.pushes;
@@ -153,8 +168,12 @@ struct alignas(kCacheLine) Stats {
         joins += o.joins, cross_joins += o.cross_joins;
         completed += o.completed, failed_instances += o.failed_instances;
         wasted_after_failure += o.wasted_after_failure, busy_ticks += o.busy_ticks;
+        stalls += o.stalls, slow += o.slow, slow_stalled += o.slow_stalled, slow_late += o.slow_late;
+        slow_late_submit += o.slow_late_submit, slow_neither += o.slow_neither;
         latency.merge(o.latency);
         fail_to_done.merge(o.fail_to_done);
+        latency_clean.merge(o.latency_clean);
+        inject_delay.merge(o.inject_delay);
     }
 };
 
@@ -195,6 +214,7 @@ public:
         {
             std::lock_guard lk(inject_mu_);
             if (inject_tail_ - inject_head_ == kInjectCap) return false;
+            if (cfg_.stall_ticks) inst.submitted_tsc = TscClock::now();
             inject_ring_[inject_tail_++ % kInjectCap] = &inst.nodes[inst.shape->source];
             inject_count_.store(inject_tail_ - inject_head_, std::memory_order_relaxed);
         }
@@ -243,6 +263,7 @@ private:
         NodeState* x = inject_ring_[inject_head_++ % kInjectCap];
         inject_count_.store(inject_tail_ - inject_head_, std::memory_order_relaxed);
         ++me.st.injected;
+        if (cfg_.stall_ticks) x->inst->injected_tsc = TscClock::now();
         return x;
     }
 
@@ -426,7 +447,12 @@ private:
         }
         const auto w = s.work[id];
         if (w) {
-            burn(w);
+            const auto t0      = TscClock::now();
+            const auto overrun = burn_from(t0, w) - t0 - w;
+            if (cfg_.stall_ticks && overrun > cfg_.stall_ticks) {
+                ++me.st.stalls;
+                g.stalled_ticks.fetch_add(overrun, std::memory_order_relaxed);
+            }
             me.st.busy_ticks += w;
         }
         if (id == g.fail_node) return false;
@@ -444,6 +470,27 @@ private:
             me.st.fail_to_done.record(now - failed_at);
         }
         if (g.due_tsc) me.st.latency.record(now > g.due_tsc ? now - g.due_tsc : 0);
+        if (cfg_.stall_ticks && g.due_tsc) {
+            // stalled_ticks was added to by bodies that all precede the sink, so
+            // the acquire chain into this node has made every addition visible.
+            const auto lat     = now > g.due_tsc ? now - g.due_tsc : 0;
+            const auto inject  = g.injected_tsc > g.due_tsc ? g.injected_tsc - g.due_tsc : 0;
+            const bool stalled = g.stalled_ticks.load(std::memory_order_relaxed) != 0;
+            const bool late    = inject > cfg_.slow_ticks / 2;
+            // Late because the submitter itself was late, rather than because no
+            // worker took it: more than half of the injection delay came before
+            // submit() queued it.
+            const auto submit = g.submitted_tsc > g.due_tsc ? g.submitted_tsc - g.due_tsc : 0;
+            me.st.inject_delay.record(inject);
+            if (!stalled) me.st.latency_clean.record(lat);
+            if (lat > cfg_.slow_ticks) {
+                ++me.st.slow;
+                me.st.slow_stalled += stalled;
+                me.st.slow_late += late;
+                me.st.slow_late_submit += late && 2 * submit > inject;
+                me.st.slow_neither += !stalled && !late;
+            }
+        }
         if (g.verify) {
             const Shape& s = *g.shape;
             for (std::uint32_t i = 0; i < s.n; ++i) {
