@@ -37,7 +37,7 @@ the runtime has already decided for you.
 
 | | thesis |
 |---|---|
-| [**cpp/solution.md**](cpp/solution.md) | Relaxed is wrong, and on x86-64 nothing but a race detector can tell: every spelling of the decrement compiles to the same `lock dec`. The contract is release on every decrement plus one acquire by the last predecessor, spelled as an acquire *load* of the counter so that ThreadSanitizer can vouch for it, plus a work-stealing deque that publishes rather than merely queues, and a graph whose shared part is immutable so a predecessor may still read it after the run has ended. Then the scheduler: inline continuation (14 ns a hop against 76–93 ns through the deque), fusion to a few microseconds a task, rank priority that Brent's bound left almost nothing to win, and failure that still resolves every edge once. The follow-up's amplification reproduces (thieves made the owner's hop four to six times slower; 1.61 × 10⁸ steal attempts/s, 98 % failing). So, intermittently, does its symptom: near saturation, 64 greedy workers on 24 CPUs had p99 up to 43 ms in half of eight runs, where 24 never passed 1.5 ms. Sleeping hurt the tail in every run, and a small search budget works only after fusion. Tail claims come from eight runs, because one run can rank the arms either way. |
+| [**cpp/solution.md**](cpp/solution.md) | Relaxed is wrong, and on x86-64 nothing but a race detector can tell: every spelling of the decrement compiles to the same `lock dec`. The contract is release on every decrement plus one acquire by the last predecessor, spelled as an acquire *load* of the counter so that ThreadSanitizer can vouch for it, plus a work-stealing deque that publishes rather than merely queues, and a graph whose shared part is immutable so a predecessor may still read it after the run has ended. Then the scheduler: inline continuation (14 ns a hop against 76–93 ns through the deque), fusion to a few microseconds a task, rank priority that Brent's bound left almost nothing to win, and failure that still resolves every edge once. The follow-up's amplification reproduces (thieves made the owner's hop four to six times slower; 1.61 × 10⁸ steal attempts/s, 98 % failing). Its worse tail does not, on one socket: spikes to 43 ms on one day did not recur in 26 later runs. Sleeping hurt the tail in every run, a small search budget works only after fusion, and under a budget much of the tail is the producer's, which pays to wake sleepers. Tail claims come from eight runs, because one run can rank the arms either way. |
 | go/solution.md | not written — [go/question.md](go/question.md) |
 | python/solution.md | not written — [python/question.md](python/question.md) |
 
@@ -70,11 +70,12 @@ the runtime has already decided for you.
 - **Sixteen idle thieves made their victim's hop four to six times slower** with nothing to steal,
   and 64 greedy workers spent 21.0 cores doing 11.9 cores of work.
   ([cpp §10](cpp/solution.md#10-the-follow-up-stealing-amplification))
-- **More workers, the same median, a tail tens of times worse, on one socket.** At 20,000 events/s,
-  18.2 cores of work on 24 CPUs, 64 greedy workers had p99 from 516 µs to 43.2 ms across eight runs,
-  above 5 ms in four. 24 greedy workers stayed under 1.5 ms in all eight, and fusing tasks 8 to 1 kept
-  64 workers under 1 ms. The likely cause, workers descheduled mid-task by oversubscription, is a
-  hypothesis, and §10 names the check.
+- **A tail that looked like the follow-up's, and was the machine's.** On one day, 64 greedy workers
+  at 20,000 events/s had p99 spikes to 43 ms in four of eight runs. In 26 runs since, alternating the
+  binary from that day with the current one, none went above 3 ms. Tracing every slow event found
+  descheduled task bodies behind only 6–17 % of them in the greedy arms, and under a search budget
+  found more than half of the late ones queued late by the producer itself, which pays to wake
+  sleepers.
   ([cpp §10](cpp/solution.md#under-load))
 - **A search budget of four without fusion was the worst arm in six of eight runs**, at p99 2.3–82 ms.
   With tasks fused 8 to 1, the same budget came within a bucket or two of the greedy tail at under
@@ -130,6 +131,24 @@ done
 `--bug` exits 1 when the stress detected the bug, and TSan exits 66 when it reported a race. A hang
 counts as a detection after 15 s, or after 300 s under TSan, where a run that is printing reports can
 take minutes and still finish.
+
+</details>
+
+<details>
+<summary>On a Linux server (the follow-up's 64 cores)</summary>
+
+Phase 6 sizes itself to the machine: 16, 32, 64, C and 2C workers, where C is the CPU count, at 12
+cores of work and at 0.76 C. Phase 0 measures the cross-node line transfer when there is a second
+NUMA node. From the kata directory on an Ubuntu machine:
+
+```sh
+cpp/remote/run.sh --smt-off      # toolchain, machine record, two full runs, phase 6 repeated
+```
+
+It writes `remote-out/` and bundles it as `remote-out.tgz`. `--smt-off` makes one logical CPU one
+core; on a bare-metal `c6i.metal` that leaves 64 cores across two sockets. `--quick` builds and runs
+phases 0 and 2 only, to trial the script. `KEYSTONE_STALL_TRACE=0` turns phase 6's slow-event
+attribution off, and the script runs phase 6 twice that way to check the tracing changes nothing.
 
 </details>
 

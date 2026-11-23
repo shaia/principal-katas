@@ -55,7 +55,7 @@ explode. The full text is in [../reference-outline.md](../reference-outline.md).
 | `std::vector` and `std::function` per task | an allocation per task at a million tasks, and a counter on the same cache line as fields the running worker reads. The executor splits an immutable shape from per-run state and pads each counter to a line (§4) |
 | — | **no statement about when a graph may be freed or reused**, though a predecessor can still be running after the graph it belongs to has finished (§4) |
 | 1 M active tasks, 64 workers, p99 < 5 ms | numbers that cannot all describe *ready* tasks. A million ready 450 ns tasks take 1 M × 450 ns / 64 ≈ 7 ms to drain on 64 workers. By Little's law, a million tasks in flight at the follow-up's 1.4 M tasks/s spend about 0.7 s each. So "active" must mean mostly waiting, and the number a design needs, how many are ready at once, is the one the brief does not give |
-| 16 → 64 workers, p99 4 → 18 ms | a machine with more cores than this one, and probably two sockets. §10 reproduces the amplification, and intermittently the worse tail, from oversubscription. It says what it cannot reproduce |
+| 16 → 64 workers, p99 4 → 18 ms | a machine with more cores than this one, and probably two sockets. §10 reproduces the amplification and not the worse tail, says what the slow events here were, and how the 64-core run tests the rest |
 
 ### How the answer is graded
 
@@ -586,9 +586,8 @@ population: events that stay on one worker got faster, and events whose critical
 or a remote steal got much slower.
 
 This machine runs a different regime. Below, 64 greedy workers spent 21.0 cores on 11.9 cores of
-work, 57 % useful against the table's 2–3 %. What reproduces here is the amplification, the cost of
-sleeping, and, intermittently, the symptom itself: more workers, the same median, a far worse tail.
-The table's ratios do not.
+work, 57 % useful against the table's 2–3 %. What reproduces here is the amplification and the cost
+of sleeping. The worse tail does not, and neither do the table's ratios.
 
 Every number below is from eight runs of phases 0, 4 and 6: medians, and ranges where a tail moves
 between runs. One run is not enough here. In the first two, the worst arm at 20,000/s was a different
@@ -658,39 +657,50 @@ What reproduced, and what did not:
 - **Steal attempts explode.** 5.02 × 10⁷/s at 16 greedy workers, 1.61 × 10⁸/s at 64, with the
   success rate falling from 5.7 % to 1.7 %. Ninety-eight attempts in a hundred find nothing, and 64
   greedy workers spent 21.0 cores doing 11.9 cores of work.
-- **More greedy thieves did not hurt the p99 at 13,000/s. At 20,000/s they did, in half the runs.**
-  At 13,000/s, 16 and 64 greedy workers had the same p99 range, 427–498 µs. At 20,000/s, with 18.2
-  cores of work on 24 CPUs, 24 greedy workers stayed between 480 µs and 1.49 ms in all eight runs.
-  64 greedy workers ranged from 516 µs to 43.2 ms, and were above 5 ms in four of the eight, with
-  the median unmoved at 409 µs. That is the follow-up's symptom on one socket: more workers, the same
-  median, a tail tens of times worse. Fusing the same 64 workers' leaves 8 to 1 removed it, at
-  427–924 µs in every run.
+- **More greedy thieves did not reliably hurt the p99.** At 13,000/s, 16 and 64 greedy workers had
+  the same p99 range, 427–498 µs. At 20,000/s, 18.2 cores of work on 24 CPUs, the eight runs above
+  had 64 greedy workers between 516 µs and 43.2 ms, above 5 ms in four, every one of them the first
+  run of a pair. None of the 26 runs since went above 3 ms: 14 of the current binary with stall
+  tracing, 6 with it off, and 6 of the binary those eight came from, alternated with the current one
+  so that both saw the same machine. So the spikes were a condition of the machine that day, not a
+  property of 64 workers, and the 43.2 ms in the table belongs to that day. In those 26 runs, 24
+  greedy workers, one per CPU, reached 3.7 and 4.8 ms in single runs too.
 - **Sleeping hurt the tail in every run.** A sleeper takes 12–16 µs at the median, and 27–142 µs at
   p99, to run after a wake (phase 0). Tokio's rule, half the workers may search, parks constantly. At
   20,000/s its p99 was above 2 ms in all eight runs at 64 workers and in seven of eight at 24, where
   greedy at 24 never reached 1.5 ms.
 
-**Why 64 greedy workers fail intermittently, these runs cannot say.** The likeliest cause is
-oversubscription near saturation: 64 runnable threads on 24 CPUs, with 18 cores of real work to do.
-Sometimes the OS deschedules a worker in the middle of a 100 µs chain step, and the event then waits
-out a time slice, which on Windows is tens of milliseconds, the size of the spikes. Fusion fits this
-reading, because an eighth as many tasks means an eighth as many hand-offs that can land on a thread
-that is not running. It is a hypothesis, and the last paragraph of this section says what would
-confirm it.
+**What the slow events were.** Phase 6 now attributes every event slower than 2 ms (table c). A
+task body spins to a deadline, so a body that ends more than 250 µs past it was off its CPU. Each
+event records whether one of its bodies was, when it was queued for injection, and when a worker
+took it. Across the 14 traced runs at 20,000/s:
 
-On a 64-core, two-socket server the extra workers are real cores running real thieves, which adds a
-steady cost to what is intermittent here. They pull the workers' `top` and `bottom` lines across the
-interconnect, which is phase 6a's four to six times per hop at cross-socket transfer prices. And every
-successful steal moves a task away from its inputs: half of those moves cross a socket, and the stolen
-task then reads its predecessors' payloads remotely. Add oversubscription wherever the workers
-outnumber the cores that are free, and the 18 ms needs nothing exotic. This too is reasoning.
+- **Descheduling explains little.** In the greedy arms' larger episodes, hundreds to thousands of
+  slow events in a run, a descheduled body explains 6–17 % of them. The rest are mostly neither
+  stalled nor late, which is queueing behind other events' work at 76 % load, and in some runs late
+  injection. Bodies are descheduled in every busy arm, even at one worker per CPU, because the
+  benchmark's submitting thread spins too. They are never the main cause.
+- **The budget's tail is largely the producer's.** In 64 workers with a budget of 4, 57–85 % of the
+  slow events left the injection queue late. In more than half of those, the submitting thread had
+  itself queued the event late: `submit` takes the injection lock and, under a budget, wakes a sleeper
+  (3–15 µs in phase 0), and at 20,000 events a second the producer falls behind. A real product's I/O
+  thread would pay the same.
+
+On a 64-core, two-socket server the extra workers are real cores running real thieves, and that is
+where the follow-up's tail would have to come from. They pull the workers' `top` and `bottom` lines
+across the interconnect, at cross-socket transfer prices. And every successful steal moves a task
+away from its inputs: half of those moves cross a socket, and the stolen task then reads its
+predecessors' payloads remotely. This is reasoning. Phase 6 sizes itself to the machine it runs on
+(16, 32, 64, C and 2C workers, at 12 cores of work and at 0.76 C), and phase 0 measures the
+cross-node line transfer where there is a second node, so the same binary can test it there.
 
 ### The redesign
 
 Phase 6b runs it one change at a time, and the order turns out to matter:
 
 1. **Task granularity first.** Fusing leaves 8 to 1, still greedy, had the best p99 at 20,000/s in
-   seven of eight runs (427–924 µs, against unfused 64 greedy's 516 µs to 43.2 ms). It cut the steal
+   seven of eight runs (427–924 µs, against unfused 64 greedy's 516 µs to 43.2 ms on the day of the
+   spikes above). It cut the steal
    success rate to 0.27 %, because there were an eighth as many tasks to find. It did not save a
    single core.
 2. **A small, fixed worker budget, second, and only second.** At most four searchers, the rest asleep,
@@ -704,7 +714,7 @@ Phase 6b runs it one change at a time, and the order turns out to matter:
 3. **Workers equal to cores, not more.** The cheapest arm that keeps the tail is 24 workers, budget 4,
    fused. At 13,000/s its p99 was 444–498 µs on 13.0 cores, against 64 greedy's 427–498 µs on 21.0. At
    20,000/s it was 480–996 µs, behind only 64 greedy fused. And 24 greedy workers kept p99 under
-   1.5 ms in every run at 20,000/s, which 64 did not. On the 64-core machine, measure whether 64
+   1.5 ms in every run of the first eight at 20,000/s. On the 64-core machine, measure whether 64
    workers beat 48 before keeping them; the cores left over are worth more to the process's I/O and to
    the OS.
 4. **NUMA, by reasoning.** One deque set per socket. Steal locally first, remotely only after a failed
@@ -722,9 +732,7 @@ What to measure first on the 64-core machine, before changing anything: steal at
 per worker, split by local and remote victim; then the time a task waits between ready and running,
 split by whether it was stolen; then CPU time spent in the idle loop. If the 18 ms is remote steals,
 the second shows it. If it is thieves taxing owners, the first and third do. If it is
-oversubscription, as the intermittent spikes here suggest, compare each chain step's wall time with
-its thread's CPU time: a step that took 30 ms of wall time and 100 µs of CPU was descheduled. That
-check would settle the hypothesis on this machine too, and it is not measured yet.
+oversubscription, table c shows it as stalled bodies. Here it showed little.
 
 ---
 
@@ -746,7 +754,7 @@ The question came with an outline, Session 33's sections 3–7
 | small tasks cost atomics and queue traffic; at 100 ns a stage, "enqueueing and dequeuing … may cost more than the work itself" | Measured: a deque round trip is 76–93 ns against 14 ns inline, so a 100 ns stage pays about as much again to cross the queue. Fusing 1 µs tasks 8 to 1 takes efficiency from 56 % to 94 % (§6). |
 | work-first execution: "fairness and stack-depth concerns" | Inline continuation is a loop, not a call, so it adds no depth. Only a push to a full deque runs its task recursively, so the deque's size bounds the depth (§5). |
 | priority scheduling: "better latency for critical tasks", "starvation" | Neither showed here. FIFO stealing already wins most of it, and nothing starved (§7). |
-| the follow-up table | Its own numbers do not add up: task bodies are under 3 % of busy CPU in both columns, and utilization falls while steals rise 45× (§10). The amplification reproduces here. So, in half the runs, does the symptom: 64 greedy workers at 20,000/s had p99 up to 43 ms, where 24 stayed under 1.5 ms (§10). |
+| the follow-up table | Its own numbers do not add up: task bodies are under 3 % of busy CPU in both columns, and utilization falls while steals rise 45× (§10). The amplification reproduces here. The symptom does not: spikes of 64 greedy workers to 43 ms on one day did not recur in 26 later runs, of either binary (§10). |
 | the extension: explicit terminal states, failure propagated through the graph, "task completion accounting" separate from "successful result publication" | That is §9's design: the counter accounts for completion, and a poison flag released with the same decrement says whether the result is usable. |
 
 What the outline does not mention: that the brief's requirements cannot all describe ready tasks (the
