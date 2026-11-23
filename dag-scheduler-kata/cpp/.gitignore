@@ -1,0 +1,20 @@
+# CMake build trees.
+build/
+build-*/
+cmake-build-*/
+CMakeUserPresets.json
+
+# CMakeLists.txt pins CMAKE_RUNTIME_OUTPUT_DIRECTORY here, so bin/ is generated
+# output whichever build tree produced it — the Windows binary and the WSL
+# ThreadSanitizer one alike.
+bin/
+
+# CMAKE_EXPORT_COMPILE_COMMANDS writes this for clangd; .cache/ is clangd's.
+compile_commands.json
+.cache/
+
+# MSVC intermediates that land outside the build tree
+*.obj
+*.pdb
+*.ilk
+*.exe
