@@ -36,6 +36,9 @@ void phase_invariants(const Context& ctx) {
     for (const auto& s : shapes) std::printf("%u nodes/%zu edges  ", s.n, s.edges());
     std::printf("\n");
 
+    // The summary line speaks for this phase's checks only, not for an earlier
+    // phase's failure.
+    const int     failures_before = failure_count();
     int           configs = 0;
     std::uint64_t instances = 0, tasks = 0, steals = 0, skipped = 0, overflow = 0;
     for (int workers : {1, 4, 32, 64})
@@ -85,7 +88,7 @@ void phase_invariants(const Context& ctx) {
                 static_cast<unsigned long long>(overflow));
     check(overflow > 0, "the full-deque overflow path ran");
     std::printf("  every configuration: exactly-once, inputs seen, failure semantics, no hang — %s\n",
-                failure_count() == 0 ? "held" : "SEE FAILURES ABOVE");
+                failure_count() == failures_before ? "held" : "SEE FAILURES ABOVE");
 }
 
 }  // namespace keystone::bench

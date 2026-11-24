@@ -37,7 +37,7 @@ the runtime has already decided for you.
 
 | | thesis |
 |---|---|
-| [**cpp/solution.md**](cpp/solution.md) | Relaxed is wrong, and on x86-64 nothing but a race detector can tell: every spelling of the decrement compiles to the same `lock dec`. The contract is release on every decrement plus one acquire by the last predecessor, spelled as an acquire *load* of the counter so that ThreadSanitizer can vouch for it, plus a work-stealing deque that publishes rather than merely queues, and a graph whose shared part is immutable so a predecessor may still read it after the run has ended. Then the scheduler: inline continuation (14 ns a hop against 76–93 ns through the deque), fusion to a few microseconds a task, rank priority that Brent's bound left almost nothing to win, and failure that still resolves every edge once. The follow-up's amplification reproduces (thieves made the owner's hop four to six times slower; 1.61 × 10⁸ steal attempts/s, 98 % failing). Its worse tail does not, on one socket: spikes to 43 ms on one day did not recur in 26 later runs. Sleeping hurt the tail in every run, a small search budget works only after fusion, and under a budget much of the tail is the producer's, which pays to wake sleepers. Tail claims come from eight runs, because one run can rank the arms either way. |
+| [**cpp/solution.md**](cpp/solution.md) | Relaxed is wrong, and on x86-64 nothing but a race detector can tell: every spelling of the decrement compiles to the same `lock dec`. The contract is release on every decrement plus one acquire by the last predecessor, spelled as an acquire *load* of the counter so that ThreadSanitizer can vouch for it, plus a work-stealing deque that publishes rather than merely queues, and a graph whose shared part is immutable so a predecessor may still read it after the run has ended. Then the scheduler: inline continuation (14 ns a hop against 76–93 ns through the deque), fusion to a few microseconds a task, rank priority that Brent's bound left almost nothing to win, and failure that still resolves every edge once. The follow-up's amplification reproduces (thieves made the owner's hop four to six times slower; 1.61 × 10⁸ steal attempts/s, 98 % failing). Its worse tail does not, on one socket: spikes to 43 ms on one day did not recur in 26 later runs. On a 64-core, two-socket server it did, in every run, and most of it was where the OS put 65 spinning threads: pinned, 64 workers kept p99 under half a millisecond at 76 % load. What survives pinning is the cost of waking sleepers, which oversubscription multiplies. Sleeping hurt the tail in every run, a small search budget works only after fusion, and under a budget much of the tail is the producer's, which pays to wake sleepers. Tail claims come from repeated runs, because one run can rank the arms either way. |
 | go/solution.md | not written — [go/question.md](go/question.md) |
 | python/solution.md | not written — [python/question.md](python/question.md) |
 
@@ -77,6 +77,14 @@ the runtime has already decided for you.
   found more than half of the late ones queued late by the producer itself, which pays to wake
   sleepers.
   ([cpp §10](cpp/solution.md#under-load))
+- **On the follow-up's machine, the worse tail was mostly the OS's.** On a 64-core, two-socket AWS
+  `c6i.metal`, 64 workers with a search budget of four had p99 3.3–4.0 ms in every run at 13,000
+  events/s, against 429 µs for 16. 64 greedy workers fell seconds behind at 76 % load while 3–20 CPUs
+  sat idle. A greedy pool is 64 spinning workers and a spinning producer, and the OS doubled them up
+  on some CPUs and left others empty. Pinned, the same arms had 475–588 µs and 429–497 µs, in all five
+  alternated pairs. What survived pinning was the scheduler's: 128 budgeted workers stayed at 4–6 ms
+  at 13,000 events/s either way.
+  ([cpp §10](cpp/solution.md#on-64-cores-and-two-sockets))
 - **A search budget of four without fusion was the worst arm in six of eight runs**, at p99 2.3–82 ms.
   With tasks fused 8 to 1, the same budget came within a bucket or two of the greedy tail at under
   two thirds of the CPU. Granularity first, budget second. The textbook budget, half the workers, had
@@ -142,13 +150,16 @@ cores of work and at 0.76 C. Phase 0 measures the cross-node line transfer when 
 NUMA node. From the kata directory on an Ubuntu machine:
 
 ```sh
-cpp/remote/run.sh --smt-off      # toolchain, machine record, two full runs, phase 6 repeated
+cpp/remote/run.sh --smt-off              # toolchain, machine record, two full runs, phase 6 repeated
+cpp/remote/run.sh --smt-off --pin-ab 5   # phase 6 in five pairs: OS-placed and pinned, alternating
 ```
 
 It writes `remote-out/` and bundles it as `remote-out.tgz`. `--smt-off` makes one logical CPU one
 core; on a bare-metal `c6i.metal` that leaves 64 cores across two sockets. `--quick` builds and runs
 phases 0 and 2 only, to trial the script. `KEYSTONE_STALL_TRACE=0` turns phase 6's slow-event
 attribution off, and the script runs phase 6 twice that way to check the tracing changes nothing.
+On Linux phase 6 also prints table d, every CPU's busy time around each run, and `KEYSTONE_PIN=1`
+pins the workers: the submitter on CPU 0, worker *i* on CPU 1 + *i* mod (C − 1).
 
 </details>
 

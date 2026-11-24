@@ -9,7 +9,8 @@ Every number below came from running [`bin/solution.exe`](bench/), whose exit co
 on an Intel Core Ultra 9 285K (8 P-cores, 16 E-cores, 24 logical CPUs, one socket) under Windows 11
 with clang 23.1.6. The ThreadSanitizer column came from the same sources built with gcc 15.2 under
 WSL (Ubuntu 26.04). Unless a section says otherwise, figures are from one full run, the second of two
-back to back. Terms of art (TSO, LSE, release sequence, Brent's bound, …) are expanded in the
+back to back. §10's 64-core figures came from the same sources on a rented two-socket server, an AWS
+`c6i.metal`, built with clang 18.1.3 under Ubuntu 24.04; §10 says which commit each batch ran. Terms of art (TSO, LSE, release sequence, Brent's bound, …) are expanded in the
 [Glossary](#appendix-glossary).
 
 ---
@@ -55,7 +56,7 @@ explode. The full text is in [../reference-outline.md](../reference-outline.md).
 | `std::vector` and `std::function` per task | an allocation per task at a million tasks, and a counter on the same cache line as fields the running worker reads. The executor splits an immutable shape from per-run state and pads each counter to a line (§4) |
 | — | **no statement about when a graph may be freed or reused**, though a predecessor can still be running after the graph it belongs to has finished (§4) |
 | 1 M active tasks, 64 workers, p99 < 5 ms | numbers that cannot all describe *ready* tasks. A million ready 450 ns tasks take 1 M × 450 ns / 64 ≈ 7 ms to drain on 64 workers. By Little's law, a million tasks in flight at the follow-up's 1.4 M tasks/s spend about 0.7 s each. So "active" must mean mostly waiting, and the number a design needs, how many are ready at once, is the one the brief does not give |
-| 16 → 64 workers, p99 4 → 18 ms | a machine with more cores than this one, and probably two sockets. §10 reproduces the amplification and not the worse tail, says what the slow events here were, and how the 64-core run tests the rest |
+| 16 → 64 workers, p99 4 → 18 ms | a machine with more cores than this one, and probably two sockets. §10 runs it on both. Here the amplification reproduces and the worse tail does not. On a 64-core, two-socket server the worse tail reproduced in every run, and most of it was where the operating system put the threads: pinned, it shrank to what sleeping and oversubscription cost |
 
 ### How the answer is graded
 
@@ -483,9 +484,11 @@ lost wakeup would be a hang.
   AArch64 stress test would be expected to catch some of the time. On x86 only TSan sees them.
 - **A model checker.** None installed. GenMC or CDSChecker would explore a four-node diamond
   exhaustively, under the C11 model, in seconds.
-- **NUMA.** One socket. Every claim about remote steals and first-touch placement in §10 is reasoning,
-  and phase 0 says so as it starts.
-- **The follow-up's machine.** 64 workers here are 64 threads on 24 CPUs, not 64 cores.
+- **NUMA, on this machine.** One socket, and phase 0 says so as it starts. The two-socket server in §10
+  measured what the second socket costs a cache line and showed that thread placement mattered more.
+  A NUMA-aware victim order was not built, so what it would win is still reasoning.
+- **The follow-up's machine, on this machine.** 64 workers here are 64 threads on 24 CPUs, not 64
+  cores. §10's last part is the 64-core server.
 
 ### Measurement notes
 
@@ -501,7 +504,13 @@ lost wakeup would be a hang.
 - Latency runs from when an event was **due**, not when the submitter got to it, and the submitter
   spins for the last 2.5 ms rather than sleep through it. A sleep returns up to a timer tick late,
   and that lateness would be charged to the scheduler.
-- `cores` in §10 is process CPU time per second of wall time, minus the submitter thread's own.
+- `cores` in §10 is process CPU time per second of wall time, minus the submitter thread's own. On
+  the server that was not enough: a pool that never sleeps used 33–57 cores of 64, and its own CPU
+  time could not say whether the scheduler was slow or CPUs were idle. Phase 6 there also reads every
+  CPU's busy time around each run (table d, Linux only), and `KEYSTONE_PIN=1` pins the workers.
+- Phase 0 checks that the TSC agrees between cores to within 100 ns. One estimate's skew across the
+  server's sockets moved from −103 to +35 ns between runs, and failed that check once in nineteen runs. So the
+  check takes the median of five estimates and prints their spread.
 - The first version of the stress tested publication on 0.2 % of joins, because inline continuation
   and a full pipeline of instances keep a graph on the worker that started it. The cross-worker join
   count exists so that a clean stress has to show what it covered.
@@ -512,7 +521,8 @@ lost wakeup would be a hang.
 - No steal-half: a thief takes one task. The Go runtime takes half a victim's queue.
 - No NUMA-aware victim order, and no hybrid-aware one, though E-cores are the closest thing this
   machine has to a remote node: a line moves from a P-core to another P-core in 36 ns and to an E-core
-  in 77 ns.
+  in 77 ns. On the server it took 64–157 ns to a core on the same socket and 137–207 ns to one on the
+  other (§10).
 - The budgeted policy's "last searcher wakes one more" chain ramps sleepers up one wake at a time, each
   12–16 µs at the median and 27–142 µs at p99 before the sleeper runs (phase 0, eight runs). §10 shows that cost in
   the tail.
@@ -686,13 +696,81 @@ took it. Across the 14 traced runs at 20,000/s:
   (3–15 µs in phase 0), and at 20,000 events a second the producer falls behind. A real product's I/O
   thread would pay the same.
 
-On a 64-core, two-socket server the extra workers are real cores running real thieves, and that is
-where the follow-up's tail would have to come from. They pull the workers' `top` and `bottom` lines
-across the interconnect, at cross-socket transfer prices. And every successful steal moves a task
-away from its inputs: half of those moves cross a socket, and the stolen task then reads its
-predecessors' payloads remotely. This is reasoning. Phase 6 sizes itself to the machine it runs on
-(16, 32, 64, C and 2C workers, at 12 cores of work and at 0.76 C), and phase 0 measures the
-cross-node line transfer where there is a second node, so the same binary can test it there.
+### On 64 cores and two sockets
+
+On 24 CPUs the extra workers are extra threads. On the follow-up's machine they are real cores, and
+the reasoning was that the tail would come from there: thieves pulling `top` and `bottom` lines across
+the interconnect, and stolen tasks reading their inputs from the other socket. So the same sources
+ran on an AWS `c6i.metal`: two Xeon Platinum 8375C sockets of 32 cores, with SMT off so that one CPU
+is one core, Ubuntu 24.04 (Linux 7.0) and clang 18.1.3, through `cpp/remote/run.sh`. Phase 6 sizes
+itself to the machine, so the rates there are 13,000 events/s (11.9 cores of work, as here) and
+53,000/s (48.3 cores, 0.76 of 64). There were two batches. Ten runs used the merged code `b854a17`:
+two full runs, six of phases 0 and 6, and two with stall tracing off. Ten more used the commit that
+added table d. Five of those let the OS place the workers and five pinned them, alternating which
+went first in each pair.
+
+**The second socket costs a cache line about 1.75 times as much.** In 19 runs, one way from CPU 0 to
+CPU 32 on the other node took 137–207 ns (median 176). To CPU 1 on the same socket it took 64–157 ns
+(median 100). Thieves cost owners more than they do here. With 16 greedy thieves the owner's hop took
+262 ns at the median of ten runs, against 30 ns alone, about nine times slower where this machine
+shows four to six. Phase 6a's workers are not pinned, and its ranges are bimodal (145–270 ns at 16
+thieves). That was the first sign of what follows.
+
+**In the first batch, the follow-up's symptom reproduced in every run.** At 13,000/s, 16, 32 and 64
+greedy workers all had a p99 of 429 µs. With 64 workers, a budget of 4 had 3.43–3.98 ms in all ten
+runs, and 128 budgeted workers had 4.16–4.52 ms. That is "more workers, worse tail", every time. At
+53,000/s the 64-worker arms' p99s ran from 5.6 ms to 1.48 s, and most runs fell seconds behind. Only
+128 greedy workers kept up in every run, at 3.25–3.98 ms. And at 13,000/s, 64 greedy workers, which
+never sleep, used only 33–57 cores of 64.
+
+**Most of it was where the threads ran.** Table d reads every CPU's busy time around each run. A
+greedy pool is 64 spinning workers plus a spinning submitter, 65 threads for 64 CPUs. Left to the OS,
+1–28 CPUs sat idle at 13,000/s while the pool's threads were switched out 0.6–1.8 million times a
+second: the OS doubled threads up on some CPUs while others idled. Pinned, with the submitter alone on
+CPU 0 and worker *i* on CPU 1 + *i* mod 63, no CPU was idle. Ranges over five runs of each,
+interleaved in pairs:
+
+| arm | rate | OS-placed: p99 | idle CPUs | pinned: p99 | idle CPUs |
+|---|---|---:|---:|---:|---:|
+| 64 greedy | 13,000/s | 429–452 µs | 1–28 | 429 µs | 0 |
+| 64 budgeted (32 searchers) | 13,000/s | 452–768 µs | 0 | 429–452 µs | 0 |
+| 64, budget 4 | 13,000/s | 3.25–3.98 ms | 0 | **475–588 µs** | 0 |
+| 64, budget 4, fused × 8 | 13,000/s | 425–429 µs | 63 | **1.27–1.36 ms** | 63 |
+| 128 budgeted | 13,000/s | 4.16–4.52 ms | 0 | 4.34–5.60 ms | 0 |
+| 64 greedy | 53,000/s | 0.74–1.11 s | 3–20 | **429–497 µs** | 0 |
+| 64 greedy, fused × 8 | 53,000/s | 98.3–115 ms | 18–25 | 429 µs | 0 |
+| 64 budgeted (32 searchers) | 53,000/s | 0.49–1.11 s | 0–15 | 1.04–1.22 ms | 0 |
+| 64, budget 4 | 53,000/s | 0.53–1.20 s | 0–15 | 1.36–1.40 ms | 0 |
+| 128 greedy | 53,000/s | 3.25–3.43 ms | 0 | 3.25–3.43 ms | 0 |
+| 128 budgeted | 53,000/s | 116–509 ms | 0 | 5.79–12.3 ms | 0 |
+
+Pinned, 64 greedy workers kept p99 under half a millisecond at 76 % load. Their closed-loop capacity
+was 67,356–67,544 events/s, against 36,835–61,197 OS-placed. Pinning barely changed the 128-worker
+greedy pool, which keeps every CPU busy either way. Why the OS left CPUs idle these measurements do
+not say. That it did, and that pinning ended it, they do. Each bold difference went the same way in
+all five pairs.
+
+What survives pinning is the scheduler's:
+
+- **Sleeping still costs under load.** At 53,000/s, pinned budgeted pools had 1.04–1.40 ms against
+  greedy's 429–497 µs.
+- **Oversubscribing with sleepers is the follow-up's symptom on any placement.** With 128 budgeted
+  workers, p99 at 13,000/s was 4.2–5.6 ms placed or pinned, against 429–475 µs for 128 greedy. About
+  three in four of its slow events had a body taken off its CPU mid-run (table c). A woken worker
+  shares a CPU with a running one.
+- **A budget that saves no CPU.** Pinned, unfused 64 workers with a budget of 4 got their tail back,
+  but did 11.9 cores of work on 62.7 cores, as much as greedy. A sleeper woken on its own idle CPU
+  runs at once, finds one of 256 leaves, and wakes the next, until every worker is awake. Fused, the
+  same budget used 13.2 cores, and pinned, its p99 rose to 1.27–1.36 ms against 425–429 µs placed, in
+  every pair, with almost no event slower than 2 ms. So the whole distribution moved, not a few stalls.
+  A pinned sleeper wakes where it was pinned, on an idle CPU that is as likely to be on the other
+  socket as on the waker's. The OS would run it next to the thread that woke it. That is a guess and was not
+  measured.
+
+So on the follow-up's machine the answer has three parts. The worse tail was real and reproducible.
+Most of it was not the work-stealing scheduler but 65 runnable threads placed by the OS across two
+sockets. What remains once that is controlled is the cost of waking sleepers, which oversubscription
+multiplies.
 
 ### The redesign
 
@@ -714,25 +792,31 @@ Phase 6b runs it one change at a time, and the order turns out to matter:
 3. **Workers equal to cores, not more.** The cheapest arm that keeps the tail is 24 workers, budget 4,
    fused. At 13,000/s its p99 was 444–498 µs on 13.0 cores, against 64 greedy's 427–498 µs on 21.0. At
    20,000/s it was 480–996 µs, behind only 64 greedy fused. And 24 greedy workers kept p99 under
-   1.5 ms in every run of the first eight at 20,000/s. On the 64-core machine, measure whether 64
-   workers beat 48 before keeping them; the cores left over are worth more to the process's I/O and to
-   the OS.
+   1.5 ms in every run of the first eight at 20,000/s. On the 64-core server, equal was not enough
+   on its own. With a spinning producer beside them, 64 workers placed by the OS left CPUs idle and
+   lost their tail, and the same 64 pinned kept p99 under half a millisecond at 76 % load. Count every
+   thread that has to run beside the pool, the producer and the process's I/O, and either place the
+   threads or leave them room. Whether 48 workers beat 64 there was not measured.
 4. **NUMA, by reasoning.** One deque set per socket. Steal locally first, remotely only after a failed
    local sweep and with a backoff, and then take a batch (steal-half) to amortize the transfer.
    Allocate each graph instance on the socket of the worker that injects it, which first touch does if
    the pool is per socket. Keep a graph on one socket unless it is wide enough to need two. None of this
-   is measured here.
+   was built. The server measured the price it is about: a line from the other socket cost 1.76 times
+   one from the same socket.
 5. **Priority stays where §7 put it.** Run the critical successor inline, let the FIFO steal end do the
    rest, and keep rank as a tie-breaker. Priority cannot win back what a remote steal costs.
 
 The Go runtime's version of item 2 is different from the one that failed here. Spinning threads may
 not exceed half of the *busy* ones, rather than half of all, so the budget shrinks as idleness grows.
 
-What to measure first on the 64-core machine, before changing anything: steal attempts and successes
-per worker, split by local and remote victim; then the time a task waits between ready and running,
-split by whether it was stolen; then CPU time spent in the idle loop. If the 18 ms is remote steals,
-the second shows it. If it is thieves taxing owners, the first and third do. If it is
-oversubscription, table c shows it as stalled bodies. Here it showed little.
+What to measure first on the 64-core machine, before changing anything: where the threads ran. Every
+CPU's busy time, beside the process's own. On the server that explained more of the tail than any
+change to the scheduler would have, and nothing the process measured about itself could show it. Then
+steal attempts and successes per worker, split by local and remote victim. Then the time a task
+waits between ready and running, split by whether it was stolen. Then CPU time spent in the idle
+loop. If the 18 ms is remote steals, the second of those shows it. If it is thieves taxing owners, the
+first and third do. If it is oversubscription, table c shows it as stalled bodies. On 24 CPUs table c
+showed little. On the server it showed exactly that for 128 budgeted workers.
 
 ---
 
@@ -749,18 +833,19 @@ The question came with an outline, Session 33's sections 3–7
 | invariants: the graph fully initialized before execution, each predecessor decrements exactly once, result storage stays alive, predecessors stop modifying what successors read | Right, and one short. "Result storage" covers the payloads. It does not cover the successor list the completing predecessor is still walking after its last decrement, which is the lifetime race (§4). "Exactly once" is the assumption a failure path breaks: resolving twice hangs (§8), so failure resolves every edge once (§9). |
 | "assuming the queue provides the necessary release/acquire handoff"; the deque's protocol "must be proven separately" | Right, and the warning is earned. The textbook C11 Chase–Lev thief reads the slot `relaxed`, and the owner's pop stores `bottom` relaxed, so a thief can take a task without synchronizing with its push. The relaxed-publish row in §8 is that gap, and TSan reports it (§5). |
 | "Correct memory ordering is part of the scheduler's API contract" | Agreed. The contract (§3) is stated so that task bodies read and write plain fields. |
-| stealing costs: cross-core transfers, NUMA, contention among stealers, reclamation, fairness | Cross-core cost measured: idle thieves made the owner's hop four to six times slower (§10). Reclamation is avoided by a bounded deque that runs overflow inline (§5). NUMA cannot be measured on one socket. |
+| stealing costs: cross-core transfers, NUMA, contention among stealers, reclamation, fairness | Cross-core cost measured: idle thieves made the owner's hop four to six times slower here, and about nine times on the two-socket server, where a line from the other socket cost 1.76 times one from the same socket (§10). Reclamation is avoided by a bounded deque that runs overflow inline (§5). A NUMA-aware victim order was not built. |
 | T_P ≥ max(W/P, L); 10,000 × 1 µs with a 2,000-task chain cannot beat 2 ms | Right, and it stops at the half that matters less. The upper bound W/P + L ≈ 2.16 ms is within 8 % of it, and W/L = 5 workers' worth of parallelism (§7). On the fork graph, Brent's bound left 27 µs for priority to win. |
 | small tasks cost atomics and queue traffic; at 100 ns a stage, "enqueueing and dequeuing … may cost more than the work itself" | Measured: a deque round trip is 76–93 ns against 14 ns inline, so a 100 ns stage pays about as much again to cross the queue. Fusing 1 µs tasks 8 to 1 takes efficiency from 56 % to 94 % (§6). |
 | work-first execution: "fairness and stack-depth concerns" | Inline continuation is a loop, not a call, so it adds no depth. Only a push to a full deque runs its task recursively, so the deque's size bounds the depth (§5). |
 | priority scheduling: "better latency for critical tasks", "starvation" | Neither showed here. FIFO stealing already wins most of it, and nothing starved (§7). |
-| the follow-up table | Its own numbers do not add up: task bodies are under 3 % of busy CPU in both columns, and utilization falls while steals rise 45× (§10). The amplification reproduces here. The symptom does not: spikes of 64 greedy workers to 43 ms on one day did not recur in 26 later runs, of either binary (§10). |
+| the follow-up table | Its own numbers do not add up: task bodies are under 3 % of busy CPU in both columns, and utilization falls while steals rise 45× (§10). The amplification reproduces on both machines. The symptom did not reproduce on 24 CPUs: spikes of 64 greedy workers to 43 ms on one day did not recur in 26 later runs. On the 64-core server it reproduced in every run, 3.3–4.0 ms for 64 workers with a budget of 4 against 429 µs for 16, until the workers were pinned: then 475–588 µs. Most of it was the OS's placement. What survives pinning is the cost of waking sleepers, multiplied by oversubscription (§10). |
 | the extension: explicit terminal states, failure propagated through the graph, "task completion accounting" separate from "successful result publication" | That is §9's design: the counter accounts for completion, and a poison flag released with the same decrement says whether the result is usable. |
 
 What the outline does not mention: that the brief's requirements cannot all describe ready tasks (the
 problem table), the ThreadSanitizer false positive on the fence spelling (§8), the cost of *sleeping*
-thieves, which here was worse than spinning ones (§10), and that on x86 nothing but a race detector
-can tell the brief's code from the fix.
+thieves, which here was worse than spinning ones (§10), where the operating system puts the threads,
+which on the follow-up's machine moved p99 more than the idle policy did (§10), and that on x86
+nothing but a race detector can tell the brief's code from the fix.
 
 ---
 
