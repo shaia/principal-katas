@@ -11,6 +11,12 @@ not the same as having seen the others.** The relaxed RMW chain guarantees the f
 about the second. Then the follow-up, which is a different kind of question: going from 16 to 64
 workers raises throughput and makes p99 worse while steal attempts explode.
 
+The brief is based on a real case: a C++20 parallel execution engine for an endpoint security
+product, which turns every event on a machine into a DAG of analysis tasks, with up to a million
+tasks active, 64 worker threads, and a p99 budget of 5 ms an event. The follow-up's numbers came with
+the question and are illustrative. [cpp §10](cpp/solution.md#whether-the-table-adds-up) checks them
+before explaining them.
+
 It is staged as a kata: eleven steps and the follow-up, each with probes, a hint, and a
 self-assessable gate, and the answer sketch folded at the bottom. Three language tracks then ask what
 the shared question cannot:
