@@ -21,6 +21,7 @@
 #include "scheduler.hpp"
 
 #include <cstdint>
+#include <vector>
 
 namespace keystone::bench {
 
@@ -45,6 +46,11 @@ struct Result {
     std::uint64_t submitted = 0;
     std::uint64_t rejected  = 0;
     int           max_searchers = 0;
+    // Over the same window as cpu_s, where the OS says (Linux): the busy fraction
+    // of each online CPU, whoever ran on it, and how often this process's threads
+    // were switched out while runnable.
+    std::vector<double> cpu_busy;
+    std::uint64_t       preempted = 0;
 
     double per_sec() const { return wall_s > 0 ? static_cast<double>(st.completed) / wall_s : 0; }
     double cores_busy() const { return wall_s > 0 ? cpu_s / wall_s : 0; }

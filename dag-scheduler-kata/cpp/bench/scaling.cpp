@@ -17,7 +17,10 @@
 //      redesign one change at a time: tasks fused 8 to 1, a budget of four
 //      searchers, both, and both at the CPU count. Then where each arm's slow
 //      events lost their time: a body taken off its CPU, a late start from the
-//      injection queue, or neither.
+//      injection queue, or neither. Where the OS reports per-CPU time (Linux),
+//      where the CPUs went: a pool that never sleeps should keep every CPU busy,
+//      and one that leaves some idle has doubled up elsewhere. KEYSTONE_PIN=1
+//      pins the workers, to tell the scheduler apart from the OS's placement.
 
 #include "driver.hpp"
 #include "harness.hpp"
@@ -95,7 +98,24 @@ struct Row {
     std::vector<double> p50, p99, p999, attempts, success, cores, parks;
     std::vector<double> p99_clean, inject_p99;
     std::uint64_t       slow = 0, stalled = 0, late = 0, late_submit = 0, neither = 0, stalls = 0;
+    // Table d, where the OS reports per-CPU time.
+    std::vector<double> machine_busy, idle_cpus, least_busy, preempt;
 };
+
+// An environment switch that is on unless set to "0", or off unless set to "1".
+bool env_flag(const char* name, bool fallback) {
+#if defined(_WIN32)
+    char*       v = nullptr;
+    std::size_t n = 0;
+    if (_dupenv_s(&v, &n, name) != 0 || !v) return fallback;
+    const bool on = std::strcmp(v, "0") != 0;
+    std::free(v);
+    return on;
+#else
+    const char* v = std::getenv(name);
+    return v ? std::strcmp(v, "0") != 0 : fallback;
+#endif
+}
 
 void under_load(const Context& ctx) {
     const Shape shapes[] = {
@@ -128,20 +148,12 @@ void under_load(const Context& ctx) {
     const std::uint64_t slow_ticks  = ctx.clk.ticks(2e6);    // an event slower than 2 ms
     // KEYSTONE_STALL_TRACE=0 turns the tracing off, for checking that it does not
     // change what it measures. Table c is then empty.
-    const bool trace = [] {
-#if defined(_WIN32)
-        char*       v = nullptr;
-        std::size_t n = 0;
-        if (_dupenv_s(&v, &n, "KEYSTONE_STALL_TRACE") != 0) return true;
-        const bool off = v && std::strcmp(v, "0") == 0;
-        std::free(v);
-        return !off;
-#else
-        const char* v = std::getenv("KEYSTONE_STALL_TRACE");
-        return !(v && std::strcmp(v, "0") == 0);
-#endif
-    }();
+    const bool trace = env_flag("KEYSTONE_STALL_TRACE", true);
     if (!trace) std::printf("     (stall tracing off: KEYSTONE_STALL_TRACE=0)\n");
+    // KEYSTONE_PIN=1 pins the workers (CPU 0 left to the submitter), for telling
+    // the scheduler's behaviour apart from where the OS put its threads.
+    const bool pin = env_flag("KEYSTONE_PIN", false);
+    if (pin) std::printf("     (workers pinned, KEYSTONE_PIN=1: the submitter on CPU 0, worker i on CPU 1 + i mod %d)\n", c - 1);
 
     std::vector<std::vector<double>> cap(arms.size());
     std::vector<std::vector<Row>>    rows(std::size(rates), std::vector<Row>(arms.size()));
@@ -152,6 +164,7 @@ void under_load(const Context& ctx) {
             cfg.workers       = a.workers;
             cfg.idle          = a.idle;
             cfg.max_searchers = a.max_searchers;
+            cfg.pin           = pin;
             const Shape& s    = shapes[a.shape];
 
             Load closed;
@@ -191,6 +204,15 @@ void under_load(const Context& ctx) {
                 r.slow += o.st.slow, r.stalled += o.st.slow_stalled, r.late += o.st.slow_late;
                 r.late_submit += o.st.slow_late_submit;
                 r.neither += o.st.slow_neither, r.stalls += o.st.stalls;
+                if (!o.cpu_busy.empty()) {
+                    double sum = 0, least = 1;
+                    int    idle = 0;
+                    for (double b : o.cpu_busy) sum += b, least = std::min(least, b), idle += b < 0.5;
+                    r.machine_busy.push_back(sum);
+                    r.idle_cpus.push_back(idle);
+                    r.least_busy.push_back(100 * least);
+                    r.preempt.push_back(static_cast<double>(o.preempted) / o.wall_s);
+                }
             }
         }
     for (std::size_t ri = 0; ri < std::size(rates); ++ri) {
@@ -228,6 +250,24 @@ void under_load(const Context& ctx) {
                         static_cast<unsigned long long>(r.stalled), static_cast<unsigned long long>(r.late),
                         static_cast<unsigned long long>(r.late_submit), static_cast<unsigned long long>(r.neither),
                         static_cast<unsigned long long>(r.stalls));
+        }
+    }
+
+    if (rows[0][0].machine_busy.empty()) return;  // the OS does not report per-CPU time
+    std::printf("  d. where the CPUs went, over the same open-loop runs. cores is this process's CPU time per second\n"
+                "     (the submitter's excluded); CPUs busy is every online CPU's busy time per second, whoever ran;\n"
+                "     idle CPUs is how many were busy less than half the time. A pool that never sleeps but leaves\n"
+                "     CPUs idle has two workers on one CPU somewhere. switched out: this process's threads taken off\n"
+                "     a CPU while still runnable, preempted or yielding to another thread there. Medians of 3.\n");
+    for (std::size_t ri = 0; ri < std::size(rates); ++ri) {
+        std::printf("    at %.0f/s:\n", rates[ri]);
+        std::printf("    %-24s %6s %10s %10s %13s %15s\n", "workers, idle policy", "cores", "CPUs busy", "idle CPUs",
+                    "least busy", "switched out/s");
+        for (std::size_t i = 0; i < arms.size(); ++i) {
+            const Row& r = rows[ri][i];
+            std::printf("    %-24s %6.1f %10.1f %10.0f %12.0f%% %15.0f\n", arms[i].label.c_str(), median_of(r.cores, self),
+                        median_of(r.machine_busy, self), median_of(r.idle_cpus, self), median_of(r.least_busy, self),
+                        median_of(r.preempt, self));
         }
     }
 }

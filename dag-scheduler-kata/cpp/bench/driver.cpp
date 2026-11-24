@@ -99,10 +99,14 @@ Result run(const Context& ctx, const Shape& shape, const Config& cfg, const Load
 
     Result r;
     r.max_searchers = sched.max_searchers();
+    // Pinned workers leave CPU 0 to this thread, which spins between arrivals.
+    if (cfg.pin) pin_to_cpu(0);
     sched.start();
-    const double cpu0 = process_cpu_seconds(ctx.clk.ns_per_tick());
-    const double me0  = thread_cpu_seconds(ctx.clk.ns_per_tick());
-    const auto   t0   = TscClock::now();
+    const auto          cpus0 = cpu_times();
+    const std::uint64_t pre0  = involuntary_switches();
+    const double        cpu0  = process_cpu_seconds(ctx.clk.ns_per_tick());
+    const double        me0   = thread_cpu_seconds(ctx.clk.ns_per_tick());
+    const auto          t0    = TscClock::now();
 
     if (closed) {
         sh.issued.store(static_cast<std::uint64_t>(pool), std::memory_order_relaxed);
@@ -157,10 +161,19 @@ Result run(const Context& ctx, const Shape& shape, const Config& cfg, const Load
     // The submitter's own time is not the scheduler's: it spins between arrivals.
     const double me1 = thread_cpu_seconds(ctx.clk.ns_per_tick());
     const double cpu1 = process_cpu_seconds(ctx.clk.ns_per_tick());
+    const std::uint64_t pre1  = involuntary_switches();
+    const auto          cpus1 = cpu_times();
     sched.stop();
+    if (cfg.pin) unpin();
     r.st     = sched.totals();
     r.wall_s = ctx.clk.to_ns(t1 - t0) * 1e-9;
     r.cpu_s  = (cpu1 - cpu0) - (me1 - me0);
+    r.preempted = pre1 - pre0;
+    if (cpus0.size() == cpus1.size())
+        for (std::size_t c = 0; c < cpus1.size(); ++c) {
+            const auto total = cpus1[c].total - cpus0[c].total;
+            if (total > 0) r.cpu_busy.push_back(static_cast<double>(cpus1[c].busy - cpus0[c].busy) / static_cast<double>(total));
+        }
     return r;
 }
 
