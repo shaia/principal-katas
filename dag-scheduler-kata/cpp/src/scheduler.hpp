@@ -136,6 +136,10 @@ struct Config {
     // between due and taken), or to neither. In TSC ticks.
     std::uint64_t stall_ticks = 0;
     std::uint64_t slow_ticks  = 0;
+    // Pin worker i to pinned_worker_cpu(i), leaving CPU 0 to the submitter. Off,
+    // the OS places the threads; on a two-socket machine that left CPUs idle
+    // while every worker spun, so the benchmark measures both.
+    bool pin = false;
 };
 
 struct alignas(kCacheLine) Stats {
@@ -244,6 +248,7 @@ private:
 
     void run(int self) {
         Worker& me = workers_[static_cast<std::size_t>(self)];
+        if (cfg_.pin) pin_to_cpu(pinned_worker_cpu(self));
         while (!stop_.load(std::memory_order_relaxed)) {
             NodeState* x = nullptr;
             // Even a worker that never runs dry looks at the shared queue now and

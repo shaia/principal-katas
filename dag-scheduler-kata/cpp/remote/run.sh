@@ -4,12 +4,15 @@
 # Written for the follow-up's hardware: a 64-core, two-socket server. Run it from
 # the kata directory (the one holding cpp/):
 #
-#   cpp/remote/run.sh [--smt-off] [--phase6-reps N] [--skip-install] [--quick]
+#   cpp/remote/run.sh [--smt-off] [--phase6-reps N] [--pin-ab N] [--skip-install] [--quick]
 #
 #   --smt-off        turn SMT off first, so that one logical CPU is one core. On a
 #                    bare-metal c6i.metal that leaves 64 cores across 2 sockets.
 #   --phase6-reps N  extra runs of phases 0 and 6 after the two full runs (default 6).
 #                    Tails here need repetition: one run can rank the arms either way.
+#   --pin-ab N       instead of the above: N pairs of phase 6, workers placed by the OS
+#                    and pinned (KEYSTONE_PIN=1), alternating which goes first, after one
+#                    discarded warm-up run.
 #   --skip-install   do not apt-get the toolchain (it is already there).
 #   --quick          build, then phases 0 and 2 only: a trial of the script, not a measurement.
 #
@@ -17,11 +20,12 @@
 # code is nonzero if any run's checks failed; the logs say which.
 set -uo pipefail
 
-smt_off=0 reps=6 install=1 quick=0
+smt_off=0 reps=6 install=1 quick=0 pin_ab=0
 while [ $# -gt 0 ]; do
     case "$1" in
     --smt-off) smt_off=1 ;;
     --phase6-reps) reps="$2"; shift ;;
+    --pin-ab) pin_ab="$2"; shift ;;
     --skip-install) install=0 ;;
     --quick) quick=1 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -86,6 +90,19 @@ run() {  # run <log name> [args...]
 
 if [ "$quick" = 1 ]; then
     run quick-0-2 --phase 0,2
+elif [ "$pin_ab" -gt 0 ]; then
+    # Placement: the same binary, OS-placed (A) and pinned (B), in pairs whose
+    # order alternates, so neither side is always the first of its pair.
+    run warmup --phase 0
+    for i in $(seq 1 "$pin_ab"); do
+        if [ $((i % 2)) = 1 ]; then
+            KEYSTONE_PIN=0 run "placed-$i" --phase 0,6
+            KEYSTONE_PIN=1 run "pinned-$i" --phase 0,6
+        else
+            KEYSTONE_PIN=1 run "pinned-$i" --phase 0,6
+            KEYSTONE_PIN=0 run "placed-$i" --phase 0,6
+        fi
+    done
 else
     # Run twice and read the second: a freshly linked binary's first run is slower.
     run full-1

@@ -19,10 +19,12 @@
 #include <windows.h>
 #elif defined(__linux__)
 #include <climits>
+#include <cstring>
 #include <ctime>
 #include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -194,9 +196,64 @@ inline double thread_cpu_seconds(double ns_per_tsc_tick) noexcept {
 #endif
 }
 
+// Busy and total time of each online CPU since boot, in the kernel's clock ticks,
+// indexed by CPU number; empty where the OS does not say. Two readings bracket a
+// run: a CPU that was mostly idle while every worker spun means two workers
+// shared another CPU, which the process's own CPU time cannot tell apart from a
+// slow scheduler. Linux only (/proc/stat); idle and iowait count as not busy.
+struct CpuTimes {
+    std::uint64_t busy = 0, total = 0;
+};
+inline std::vector<CpuTimes> cpu_times() {
+    std::vector<CpuTimes> out;
+#if defined(__linux__)
+    std::FILE* f = std::fopen("/proc/stat", "r");
+    if (!f) return out;
+    char line[512];
+    while (std::fgets(line, sizeof line, f)) {
+        if (std::strncmp(line, "cpu", 3) != 0) break;  // the per-CPU lines come first
+        if (line[3] == ' ') continue;                   // the all-CPU total
+        int                cpu  = 0;
+        unsigned long long v[8] = {};  // user nice system idle iowait irq softirq steal
+        if (std::sscanf(line, "cpu%d %llu %llu %llu %llu %llu %llu %llu %llu", &cpu, &v[0], &v[1], &v[2], &v[3], &v[4],
+                        &v[5], &v[6], &v[7]) != 9 ||
+            cpu < 0)
+            continue;
+        CpuTimes t;
+        for (unsigned long long x : v) t.total += x;
+        t.busy = t.total - v[3] - v[4];
+        if (static_cast<std::size_t>(cpu) >= out.size()) out.resize(static_cast<std::size_t>(cpu) + 1);
+        out[static_cast<std::size_t>(cpu)] = t;
+    }
+    std::fclose(f);
+#endif
+    return out;
+}
+
+// Times this process's threads were switched out while still runnable, all
+// threads, since it started: preempted, or a yield that found another thread to
+// run (Linux counts both as involuntary). Linux only; zero elsewhere.
+inline std::uint64_t involuntary_switches() noexcept {
+#if defined(__linux__)
+    rusage u{};
+    if (::getrusage(RUSAGE_SELF, &u) != 0) return 0;
+    return static_cast<std::uint64_t>(u.ru_nivcsw);
+#else
+    return 0;
+#endif
+}
+
 // ---------------------------------------------------------------- placement
 
 inline int logical_cpus() noexcept { return static_cast<int>(std::thread::hardware_concurrency()); }
+
+// Where worker `i` runs when workers are pinned: CPU 0 is left to the thread that
+// submits, and the workers take the others in turn, so a pool larger than the
+// machine doubles up evenly instead of where the OS happens to put it.
+inline int pinned_worker_cpu(int i) noexcept {
+    const int n = logical_cpus();
+    return n > 1 ? 1 + i % (n - 1) : 0;
+}
 
 // Efficiency class per logical CPU, higher meaning faster, or empty where the OS
 // does not say. On a hybrid part this is the P-core / E-core split; WSL exposes

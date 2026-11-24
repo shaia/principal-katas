@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -67,6 +68,33 @@ PingPong ping_pong(const Context& ctx, int cpu_a, int cpu_b, int rounds = 20000)
     unpin();
     return PingPong{ctx.clk.to_ns(static_cast<double>(min_ab - min_ba) / 2),
                     ctx.clk.to_ns(static_cast<double>(min_ab + min_ba) / 2)};
+}
+
+// One ping-pong's skew moved by tens of nanoseconds from run to run: across the
+// sockets of a two-socket server, from -103 to +35 ns in eight runs, and from -43
+// to +18 ns between two cores of one socket. So the check judges the median of
+// five, and the spread is printed beside it. The transfer is the first
+// estimate's, as it always was: the smallest of five would sit at the bottom of
+// one estimate's range and quietly move the figures the solution quotes.
+struct Skew {
+    double median_ns, lo_ns, hi_ns, one_way_ns;
+};
+Skew skew(const Context& ctx, int cpu_a, int cpu_b) {
+    constexpr int       kRepeats = 5;
+    std::vector<double> s;
+    double              one_way = 0;
+    for (int i = 0; i < kRepeats; ++i) {
+        const PingPong p = ping_pong(ctx, cpu_a, cpu_b);
+        s.push_back(p.skew_ns);
+        if (i == 0) one_way = p.one_way_ns;
+    }
+    std::sort(s.begin(), s.end());
+    return Skew{s[kRepeats / 2], s.front(), s.back(), one_way};
+}
+
+void print_skew(const char* label, const Skew& k) {
+    std::printf("  TSC skew       %s: %+.1f ns (median of 5, %+.1f to %+.1f)\n", label, k.median_ns, k.lo_ns,
+                k.hi_ns);
 }
 
 double pause_ns(const Context& ctx, int cpu) {
@@ -227,9 +255,10 @@ void phase_instrument(const Context& ctx) {
     else {
         std::printf("  NUMA           %d nodes; CPU %d is on node %d, CPU %d on node %d\n", n_nodes, ctx.fast_cpu,
                     nodes[static_cast<std::size_t>(ctx.fast_cpu)], remote, nodes[static_cast<std::size_t>(remote)]);
-        const auto pr = ping_pong(ctx, ctx.fast_cpu, remote);
-        std::printf("  TSC skew       CPU %d vs CPU %d (other node): %+.1f ns\n", ctx.fast_cpu, remote, pr.skew_ns);
-        check(pr.skew_ns > -100 && pr.skew_ns < 100, "TSC skew across nodes under 100 ns");
+        const Skew  pr = skew(ctx, ctx.fast_cpu, remote);
+        const auto  label = "CPU " + std::to_string(ctx.fast_cpu) + " vs CPU " + std::to_string(remote) + " (other node)";
+        print_skew(label.c_str(), pr);
+        check(pr.median_ns > -100 && pr.median_ns < 100, "TSC skew across nodes under 100 ns");
         std::printf("  line transfer  one way, CPU %d -> CPU %d on the other node: %s\n", ctx.fast_cpu, remote,
                     fmt_ns(pr.one_way_ns).c_str());
     }
@@ -243,13 +272,13 @@ void phase_instrument(const Context& ctx) {
             other = c;
             break;
         }
-    const auto pp = ping_pong(ctx, ctx.fast_cpu, other);
-    std::printf("  TSC skew       CPU %d vs CPU %d: %+.1f ns\n", ctx.fast_cpu, other, pp.skew_ns);
-    check(pp.skew_ns > -100 && pp.skew_ns < 100, "TSC skew between cores under 100 ns, so cross-core latencies mean something");
+    const Skew pp = skew(ctx, ctx.fast_cpu, other);
+    print_skew(("CPU " + std::to_string(ctx.fast_cpu) + " vs CPU " + std::to_string(other)).c_str(), pp);
+    check(pp.median_ns > -100 && pp.median_ns < 100, "TSC skew between cores under 100 ns, so cross-core latencies mean something");
     if (ctx.hybrid) {
-        const auto pe = ping_pong(ctx, ctx.fast_cpu, ctx.slow_cpu);
-        std::printf("  TSC skew       CPU %d vs CPU %d: %+.1f ns\n", ctx.fast_cpu, ctx.slow_cpu, pe.skew_ns);
-        check(pe.skew_ns > -100 && pe.skew_ns < 100, "TSC skew to a slower core under 100 ns");
+        const Skew pe = skew(ctx, ctx.fast_cpu, ctx.slow_cpu);
+        print_skew(("CPU " + std::to_string(ctx.fast_cpu) + " vs CPU " + std::to_string(ctx.slow_cpu)).c_str(), pe);
+        check(pe.median_ns > -100 && pe.median_ns < 100, "TSC skew to a slower core under 100 ns");
         std::printf("  line transfer  one way, fast CPU %d -> fast CPU %d: %s;  -> slow CPU %d: %s\n", ctx.fast_cpu,
                     other, fmt_ns(pp.one_way_ns).c_str(), ctx.slow_cpu, fmt_ns(pe.one_way_ns).c_str());
     } else {
